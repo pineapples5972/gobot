@@ -47,12 +47,13 @@ type ArchiveSession struct {
 	Description string
 	CoverURL    string
 	Files       []ArchiveFileMeta
+	CreatedAt   time.Time
 }
 
 type ArchiveFileMeta struct {
-	Name   string
-	Format string
-	Size   string
+	Name   string `json:"name"`
+	Format string `json:"format"`
+	Size   string `json:"size"`
 }
 
 // ---------------------------------------------------------
@@ -211,6 +212,7 @@ func (up *UploadProgress) Read(p []byte) (int, error) {
 // ---------------------------------------------------------
 
 func main() {
+	go startSessionCleaner()
 	botToken := os.Getenv("BOT_TOKEN")
 	if botToken == "" {
 		log.Panic("BOT_TOKEN environment variable is not set")
@@ -264,64 +266,68 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 }
 
 func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
-    parts := strings.Split(query.Data, "|")
-    if len(parts) < 3 { return }
-    
-    action := parts[1] // "img", "desc", "file"
-    sessionID := parts[2]
+	parts := strings.Split(query.Data, "|")
+	if len(parts) < 3 {
+		return
+	}
 
-    sessionMutex.Lock()
-    session, exists := archiveSessions[sessionID]
-    sessionMutex.Unlock()
+	action := parts[1] // "img", "desc", "file"
+	sessionID := parts[2]
 
-    if !exists {
-        bot.Send(tgbotapi.NewMessage(query.Message.Chat.ID, "❌ Session expired. Please send the link again."))
-        return
-    }
+	sessionMutex.Lock()
+	session, exists := archiveSessions[sessionID]
+	sessionMutex.Unlock()
 
-    chatID := query.Message.Chat.ID
+	if !exists {
+		bot.Send(tgbotapi.NewMessage(query.Message.Chat.ID, "❌ Session expired. Please send the link again."))
+		return
+	}
 
-    // --- NEW: Remove the button they just clicked ---
-    go removeClickedButton(bot, query)
-    // ------------------------------------------------
+	chatID := query.Message.Chat.ID
 
-    if action == "img" {
-        photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
-        bot.Send(photo)
-        return
-    }
+	// --- NEW: Remove the button they just clicked ---
+	go removeClickedButton(bot, query)
+	// ------------------------------------------------
 
-    if action == "desc" {
-        photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
-        caption := fmt.Sprintf("📖 *Title:* %s\n\n*Description:*\n%s", session.Title, session.Description)
-        if len(caption) > 1000 {
-            caption = caption[:997] + "..."
-        }
-        photo.Caption = caption
-        photo.ParseMode = "Markdown"
-        bot.Send(photo)
-        return
-    }
+	if action == "img" {
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
+		bot.Send(photo)
+		return
+	}
 
-    if action == "file" && len(parts) == 4 {
-        fileIdx, _ := strconv.Atoi(parts[3])
-        if fileIdx < 0 || fileIdx >= len(session.Files) { return }
+	if action == "desc" {
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
+		caption := fmt.Sprintf("📖 *Title:* %s\n\n*Description:*\n%s", session.Title, session.Description)
+		if len(caption) > 1000 {
+			caption = caption[:997] + "..."
+		}
+		photo.Caption = caption
+		photo.ParseMode = "Markdown"
+		bot.Send(photo)
+		return
+	}
 
-        f := session.Files[fileIdx]
-        statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("📥 Preparing to download %s...", filepath.Ext(f.Name))))
+	if action == "file" && len(parts) == 4 {
+		fileIdx, _ := strconv.Atoi(parts[3])
+		if fileIdx < 0 || fileIdx >= len(session.Files) {
+			return
+		}
 
-        pathParts := strings.Split(f.Name, "/")
-        for i, p := range pathParts {
-            pathParts[i] = url.PathEscape(p)
-        }
-        
-        book := &BookData{
-            Title:     session.Title,
-            DirectURL: "https://archive.org/download/" + session.ItemID + "/" + strings.Join(pathParts, "/"),
-        }
+		f := session.Files[fileIdx]
+		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("📥 Preparing to download %s...", filepath.Ext(f.Name))))
 
-        go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book)
-    }
+		pathParts := strings.Split(f.Name, "/")
+		for i, p := range pathParts {
+			pathParts[i] = url.PathEscape(p)
+		}
+
+		book := &BookData{
+			Title:     session.Title,
+			DirectURL: "https://archive.org/download/" + session.ItemID + "/" + strings.Join(pathParts, "/"),
+		}
+
+		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book)
+	}
 }
 
 func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
@@ -347,168 +353,175 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 }
 
 func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemNum int) {
-    // 1. ROUTE ARCHIVE LINKS TO THE NEW INTERACTIVE MENU
-    if strings.Contains(linkURL, "archive.org/details/") {
-        handleArchiveMenu(bot, chatID, linkURL)
-        return
-    }
+	// 1. ROUTE ARCHIVE LINKS TO THE NEW INTERACTIVE MENU
+	if strings.Contains(linkURL, "archive.org/details/") {
+		handleArchiveMenu(bot, chatID, linkURL)
+		return
+	}
 
-    // 2. ROUTE LIBGEN/DIRECT LINKS NORMALLY
-    statusMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔍 Analyzing Link #%d...", itemNum))
-    sentStatus, err := bot.Send(statusMsg)
-    if err != nil { return }
+	// 2. ROUTE LIBGEN/DIRECT LINKS NORMALLY
+	statusMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔍 Analyzing Link #%d...", itemNum))
+	sentStatus, err := bot.Send(statusMsg)
+	if err != nil {
+		return
+	}
 
-    var book *BookData
-    if strings.Contains(linkURL, "libgen.li") && !strings.HasSuffix(linkURL, ".pdf") && !strings.HasSuffix(linkURL, ".epub") {
-        book, err = scrapeLibgen(linkURL)
-    } else {
-        parsedURL, _ := url.Parse(linkURL)
-        filename := filepath.Base(parsedURL.Path)
-        if unescaped, err := url.PathUnescape(filename); err == nil {
-            filename = unescaped
-        }
-        book = &BookData{Title: sanitizeFilename(filename), DirectURL: linkURL}
-    }
+	var book *BookData
+	if strings.Contains(linkURL, "libgen.li") && !strings.HasSuffix(linkURL, ".pdf") && !strings.HasSuffix(linkURL, ".epub") {
+		book, err = scrapeLibgen(linkURL)
+	} else {
+		parsedURL, _ := url.Parse(linkURL)
+		filename := filepath.Base(parsedURL.Path)
+		if unescaped, err := url.PathUnescape(filename); err == nil {
+			filename = unescaped
+		}
+		book = &BookData{Title: sanitizeFilename(filename), DirectURL: linkURL}
+	}
 
-    if err != nil {
-        editMessage(bot, chatID, sentStatus.MessageID, fmt.Sprintf("❌ Error processing Link #%d: %v", itemNum, err), "")
-        return
-    }
+	if err != nil {
+		editMessage(bot, chatID, sentStatus.MessageID, fmt.Sprintf("❌ Error processing Link #%d: %v", itemNum, err), "")
+		return
+	}
 
-    runDownloadPipeline(bot, chatID, sentStatus.MessageID, book)
+	runDownloadPipeline(bot, chatID, sentStatus.MessageID, book)
 }
 
 func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
-    statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "🔍 Analyzing Archive.org item..."))
+	statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "🔍 Analyzing Archive.org item..."))
 
-    parts := strings.Split(pageURL, "/details/")
-    if len(parts) < 2 {
-        editMessage(bot, chatID, statusMsg.MessageID, "❌ Malformed archive.org URL", "")
-        return
-    }
-    id := strings.Split(strings.Split(parts[1], "/")[0], "?")[0]
+	parts := strings.Split(pageURL, "/details/")
+	if len(parts) < 2 {
+		editMessage(bot, chatID, statusMsg.MessageID, "❌ Malformed archive.org URL", "")
+		return
+	}
+	id := strings.Split(strings.Split(parts[1], "/")[0], "?")[0]
 
-    apiURL := "https://archive.org/metadata/" + id
-    res, err := http.Get(apiURL)
-    if err != nil || res.StatusCode != 200 {
-        editMessage(bot, chatID, statusMsg.MessageID, "❌ Failed to fetch Archive data.", "")
-        return
-    }
-    defer res.Body.Close()
+	apiURL := "https://archive.org/metadata/" + id
+	res, err := http.Get(apiURL)
+	if err != nil || res.StatusCode != 200 {
+		editMessage(bot, chatID, statusMsg.MessageID, "❌ Failed to fetch Archive data.", "")
+		return
+	}
+	defer res.Body.Close()
 
-    var archiveRes struct {
-        Metadata map[string]interface{} `json:"metadata"`
-        Files    []ArchiveFileMeta      `json:"files"`
-    }
-    json.NewDecoder(res.Body).Decode(&archiveRes)
+	var archiveRes struct {
+		Metadata map[string]interface{} `json:"metadata"`
+		Files    []ArchiveFileMeta      `json:"files"`
+	}
+	json.NewDecoder(res.Body).Decode(&archiveRes)
 
-    // Create session
-    sessionID := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // Short unique ID
-    session := &ArchiveSession{
-        ItemID:      id,
-        Title:       cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "title")),
-        Description: cleanText(stripHTML(extractDynamicInterfaceField(archiveRes.Metadata, "description"))),
-        CoverURL:    "https://archive.org/services/img/" + id,
-        Files:       archiveRes.Files,
-    }
-    if session.Title == "" { session.Title = "Archive_Item_" + id }
+	// Create session
+	sessionID := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // Short unique ID
+	session := &ArchiveSession{
+		ItemID:      id,
+		Title:       cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "title")),
+		Description: cleanText(stripHTML(extractDynamicInterfaceField(archiveRes.Metadata, "description"))),
+		CoverURL:    "https://archive.org/services/img/" + id,
+		Files:       archiveRes.Files,
+		CreatedAt:   time.Now(),
+	}
+	if session.Title == "" {
+		session.Title = "Archive_Item_" + id
+	}
 
-    sessionMutex.Lock()
-    archiveSessions[sessionID] = session
-    sessionMutex.Unlock()
+	sessionMutex.Lock()
+	archiveSessions[sessionID] = session
+	sessionMutex.Unlock()
 
-    // Build Interactive Keyboard
-    var keyboard [][]tgbotapi.InlineKeyboardButton
-    keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
-        tgbotapi.NewInlineKeyboardButtonData("🖼 Cover Image", "ar|img|"+sessionID),
-        tgbotapi.NewInlineKeyboardButtonData("📝 Cover + Desc", "ar|desc|"+sessionID),
-    ))
+	// Build Interactive Keyboard
+	var keyboard [][]tgbotapi.InlineKeyboardButton
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🖼 Cover Image", "ar|img|"+sessionID),
+		tgbotapi.NewInlineKeyboardButtonData("📝 Cover + Desc", "ar|desc|"+sessionID),
+	))
 
-    for i, f := range session.Files {
-        lowerName := strings.ToLower(f.Name)
-        if !strings.HasSuffix(lowerName, ".pdf") && !strings.HasSuffix(lowerName, ".epub") {
-            continue
-        }
+	for i, f := range session.Files {
+		lowerName := strings.ToLower(f.Name)
+		if !strings.HasSuffix(lowerName, ".pdf") && !strings.HasSuffix(lowerName, ".epub") {
+			continue
+		}
 
-        sizeMB := formatArchiveSize(f.Size)
-        btnText := fmt.Sprintf("📄 PDF (%.1f MB)", sizeMB)
-        if strings.HasSuffix(lowerName, ".epub") {
-            btnText = fmt.Sprintf("📘 EPUB (%.1f MB)", sizeMB)
-        }
+		sizeMB := formatArchiveSize(f.Size)
+		btnText := fmt.Sprintf("📄 PDF (%.1f MB)", sizeMB)
+		if strings.HasSuffix(lowerName, ".epub") {
+			btnText = fmt.Sprintf("📘 EPUB (%.1f MB)", sizeMB)
+		}
 
-        cbData := fmt.Sprintf("ar|file|%s|%d", sessionID, i)
-        keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
-            tgbotapi.NewInlineKeyboardButtonData(btnText, cbData),
-        ))
-    }
+		cbData := fmt.Sprintf("ar|file|%s|%d", sessionID, i)
+		keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(btnText, cbData),
+		))
+	}
 
-    // Remove the "Analyzing" message and send the menu
-    bot.Request(tgbotapi.NewDeleteMessage(chatID, statusMsg.MessageID))
+	// Remove the "Analyzing" message and send the menu
+	bot.Request(tgbotapi.NewDeleteMessage(chatID, statusMsg.MessageID))
 
-    msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("📖 *%s*\n\nChoose an option below:", session.Title))
-    msg.ParseMode = "Markdown"
-    msg.ReplyMarkup = tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}
-    bot.Send(msg)
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("📖 *%s*\n\nChoose an option below:", session.Title))
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}
+	bot.Send(msg)
 }
 
 func runDownloadPipeline(bot *tgbotapi.BotAPI, chatID int64, msgID int, book *BookData) {
-    ctx, cancel := context.WithCancel(context.Background())
-    taskID := fmt.Sprintf("%d-%d", chatID, msgID)
+	ctx, cancel := context.WithCancel(context.Background())
+	taskID := fmt.Sprintf("%d-%d", chatID, msgID)
 
-    taskMutex.Lock()
-    activeTasks[taskID] = cancel
-    taskMutex.Unlock()
+	taskMutex.Lock()
+	activeTasks[taskID] = cancel
+	taskMutex.Unlock()
 
-    defer func() {
-        taskMutex.Lock()
-        delete(activeTasks, taskID)
-        taskMutex.Unlock()
-        cancel()
-    }()
+	defer func() {
+		taskMutex.Lock()
+		delete(activeTasks, taskID)
+		taskMutex.Unlock()
+		cancel()
+	}()
 
-    tmpDir, bookPath, _, err := downloadFiles(ctx, bot, chatID, msgID, taskID, book)
-    if err != nil {
-        if ctx.Err() != nil {
-            editMessage(bot, chatID, msgID, "🚫 *Task Cancelled by User.*", "")
-        } else {
-            editMessage(bot, chatID, msgID, fmt.Sprintf("❌ Download failed: %v", err), "")
-        }
-        if tmpDir != "" { os.RemoveAll(tmpDir) }
-        return
-    }
-    defer os.RemoveAll(tmpDir)
+	tmpDir, bookPath, _, err := downloadFiles(ctx, bot, chatID, msgID, taskID, book)
+	if err != nil {
+		if ctx.Err() != nil {
+			editMessage(bot, chatID, msgID, "🚫 *Task Cancelled by User.*", "")
+		} else {
+			editMessage(bot, chatID, msgID, fmt.Sprintf("❌ Download failed: %v", err), "")
+		}
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
+		}
+		return
+	}
+	defer os.RemoveAll(tmpDir)
 
-    editMessage(bot, chatID, msgID, "📤 Uploading file to Telegram...", taskID)
+	editMessage(bot, chatID, msgID, "📤 Uploading file to Telegram...", taskID)
 
-    file, err := os.Open(bookPath)
-    if err != nil {
-        editMessage(bot, chatID, msgID, "❌ Failed to read local file.", "")
-        return
-    }
-    defer file.Close()
+	file, err := os.Open(bookPath)
+	if err != nil {
+		editMessage(bot, chatID, msgID, "❌ Failed to read local file.", "")
+		return
+	}
+	defer file.Close()
 
-    stat, _ := file.Stat()
-    uploadTracker := &UploadProgress{
-        Ctx: ctx, TaskID: taskID, Reader: file, TotalSize: stat.Size(),
-        Bot: bot, ChatID: chatID, MsgID: msgID, LastUpdate: time.Now(),
-    }
+	stat, _ := file.Stat()
+	uploadTracker := &UploadProgress{
+		Ctx: ctx, TaskID: taskID, Reader: file, TotalSize: stat.Size(),
+		Bot: bot, ChatID: chatID, MsgID: msgID, LastUpdate: time.Now(),
+	}
 
-    doc := tgbotapi.NewDocument(chatID, tgbotapi.FileReader{
-        Name:   filepath.Base(bookPath),
-        Reader: uploadTracker,
-    })
+	doc := tgbotapi.NewDocument(chatID, tgbotapi.FileReader{
+		Name:   filepath.Base(bookPath),
+		Reader: uploadTracker,
+	})
 
-    _, err = bot.Send(doc)
-    if err != nil {
-        if ctx.Err() != nil {
-            editMessage(bot, chatID, msgID, "🚫 *Upload Cancelled by User.*", "")
-        } else {
-            editMessage(bot, chatID, msgID, fmt.Sprintf("❌ Telegram upload failed: %v", err), "")
-        }
-        return
-    }
+	_, err = bot.Send(doc)
+	if err != nil {
+		if ctx.Err() != nil {
+			editMessage(bot, chatID, msgID, "🚫 *Upload Cancelled by User.*", "")
+		} else {
+			editMessage(bot, chatID, msgID, fmt.Sprintf("❌ Telegram upload failed: %v", err), "")
+		}
+		return
+	}
 
-    editMessage(bot, chatID, msgID, "✅ Upload Complete!", "")
+	editMessage(bot, chatID, msgID, "✅ Upload Complete!", "")
 }
 
 // ---------------------------------------------------------
@@ -829,15 +842,6 @@ func extractDynamicInterfaceField(m map[string]interface{}, key string) string {
 	return ""
 }
 
-func sanitizeFilename(name string) string {
-	re := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
-	clean := re.ReplaceAllString(name, "")
-	if len(clean) > 80 {
-		clean = clean[:80]
-	}
-	return strings.TrimSpace(clean)
-}
-
 func stripHTML(text string) string {
 	re := regexp.MustCompile(`<[^>]*>`)
 	return re.ReplaceAllString(text, "")
@@ -862,4 +866,58 @@ func editMessage(bot *tgbotapi.BotAPI, chatID int64, msgID int, newText string, 
 	}
 
 	_, _ = bot.Send(edit)
+}
+
+func removeClickedButton(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
+	if query.Message == nil || query.Message.ReplyMarkup == nil {
+		return
+	}
+
+	var newKeyboard [][]tgbotapi.InlineKeyboardButton
+
+	// Loop through existing rows
+	for _, row := range query.Message.ReplyMarkup.InlineKeyboard {
+		var newRow []tgbotapi.InlineKeyboardButton
+
+		// Loop through buttons in the row
+		for _, btn := range row {
+			// If the button's data matches what they just clicked, skip it!
+			if btn.CallbackData != nil && *btn.CallbackData == query.Data {
+				continue
+			}
+			newRow = append(newRow, btn)
+		}
+
+		// Only keep the row if it still has buttons left
+		if len(newRow) > 0 {
+			newKeyboard = append(newKeyboard, newRow)
+		}
+	}
+
+	// Update the message with the smaller keyboard
+	edit := tgbotapi.NewEditMessageReplyMarkup(
+		query.Message.Chat.ID,
+		query.Message.MessageID,
+		tgbotapi.InlineKeyboardMarkup{InlineKeyboard: newKeyboard},
+	)
+	bot.Send(edit)
+}
+
+// ---------------------------------------------------------
+// MEMORY MANAGEMENT
+// ---------------------------------------------------------
+func startSessionCleaner() {
+	// Run this check every 1 hour
+	ticker := time.NewTicker(1 * time.Hour)
+	for range ticker.C {
+		sessionMutex.Lock()
+		now := time.Now()
+		for id, session := range archiveSessions {
+			// If the session is older than 2 hours, delete it to free RAM
+			if now.Sub(session.CreatedAt) > 2*time.Hour {
+				delete(archiveSessions, id)
+			}
+		}
+		sessionMutex.Unlock()
+	}
 }
