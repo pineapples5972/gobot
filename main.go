@@ -168,7 +168,7 @@ func main() {
 		log.Panic("BOT_TOKEN environment variable is not set")
 	}
 
-	bot, err := tgbotapi.NewBotAPIWithAPIEndpoint(botToken, "http://telegram-bot-api:8081/bot%s/%s")
+	bot, err := tgbotapi.NewBotAPIWithAPIEndpoint(botToken, "http://telegram-bot-api.railway.internal:8081/bot%s/%s")
 	if err != nil {
 		log.Panicf("Failed to connect to Telegram: %v", err)
 	}
