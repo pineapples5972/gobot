@@ -1,18 +1,21 @@
-# Stage 1: Build the Go binary (Upgraded to Go 1.26)
-FROM golang:1.26-alpine AS builder
+# Stage 1: Build the Go binary (Using stable Go 1.22)
+FROM golang:1.22-alpine AS builder
 
-# Install git and certificates (needed for downloading modules and HTTPS scraping)
+# Install git and certificates
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
 
-# Copy the source code first
+# Copy your code into the container
 COPY . .
 
-# Upgrade the go.mod file to 1.26, then download dependencies
-RUN go mod edit -go=1.26
-# Force Go to bypass proxy servers and pull directly from GitHub
-ENV GOPROXY=https://goproxy.io,direct
+# Clear out any corrupted module data
+RUN go clean -modcache
+
+# Force Go to use the official global proxy (this bypasses the broken goproxy.io cache)
+ENV GOPROXY=https://proxy.golang.org,direct
+
+# Let Go naturally resolve and download the correct v5 modules
 RUN go mod tidy
 
 # Build a statically linked binary
