@@ -1,3 +1,3 @@
 module libgen-bot
 
-go 1.22.12
+go 1.25
