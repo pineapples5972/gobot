@@ -1,3 +1,4 @@
+// SNAPSHOT POINT version working good
 package main
 
 import (
