@@ -1,4 +1,3 @@
-// SNAPSHOT POINT version working good
 package main
 
 import (
@@ -45,6 +44,8 @@ var (
 type ArchiveSession struct {
 	ItemID      string
 	Title       string
+	Author      string
+	Publisher   string
 	Description string
 	CoverURL    string
 	Files       []ArchiveFileMeta
@@ -272,7 +273,7 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 		return
 	}
 
-	action := parts[1] // "img", "desc", "file"
+	action := parts[1]
 	sessionID := parts[2]
 
 	sessionMutex.Lock()
@@ -288,7 +289,6 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 
 	// --- NEW: Remove the button they just clicked ---
 	go removeClickedButton(bot, query)
-	// ------------------------------------------------
 
 	if action == "img" {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
@@ -298,12 +298,27 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 
 	if action == "desc" {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
-		caption := fmt.Sprintf("📖 *Title:* %s\n\n*Description:*\n%s", session.Title, session.Description)
+
+		// Exact formatting requested
+		caption := fmt.Sprintf("📖 Title: %s\n👤 Author: %s\n🏢 Publisher: %s\n\n📝 Description:\n%s",
+			session.Title, session.Author, session.Publisher, session.Description)
+
 		if len(caption) > 1000 {
 			caption = caption[:997] + "..."
 		}
+
 		photo.Caption = caption
-		photo.ParseMode = "Markdown"
+		bot.Send(photo)
+		return
+	}
+
+	if action == "temp" {
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
+
+		// Empty template format
+		caption := "📖 Title: \n👤 Author: \n🏢 Publisher: \n\n📝 Description:\n"
+
+		photo.Caption = caption
 		bot.Send(photo)
 		return
 	}
@@ -416,6 +431,8 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 	session := &ArchiveSession{
 		ItemID:      id,
 		Title:       cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "title")),
+		Author:      cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "creator")),
+		Publisher:   cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "publisher")),
 		Description: cleanText(stripHTML(extractDynamicInterfaceField(archiveRes.Metadata, "description"))),
 		CoverURL:    "https://archive.org/services/img/" + id,
 		Files:       archiveRes.Files,
@@ -431,9 +448,16 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 
 	// Build Interactive Keyboard
 	var keyboard [][]tgbotapi.InlineKeyboardButton
+
+	// Row 1: Just the image
 	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("🖼 Cover Image", "ar|img|"+sessionID),
+	))
+
+	// Row 2: The Description and Template buttons side-by-side
+	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("📝 Cover + Desc", "ar|desc|"+sessionID),
+		tgbotapi.NewInlineKeyboardButtonData("📋 Cover + Template", "ar|temp|"+sessionID),
 	))
 
 	for i, f := range session.Files {
