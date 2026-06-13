@@ -412,20 +412,23 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 	}
 	json.NewDecoder(res.Body).Decode(&archiveRes)
 
-	// --- NEW: Find the High-Resolution Cover ---
-	bestCoverURL := "https://archive.org/services/img/" + id // Fallback to thumbnail
-	for _, f := range archiveRes.Files {
-		lowerFormat := strings.ToLower(f.Format)
-		lowerName := strings.ToLower(f.Name)
+	// --- NEW: Actively fetch the REAL first page of the book ---
+	bestCoverURL := "https://archive.org/services/img/" + id // Ultimate fallback
 
-		// Archive.org automatically generates an "Item Image" which is the high-res cover
-		if lowerFormat == "item image" || strings.HasSuffix(lowerName, "_itemimage.jpg") || strings.HasSuffix(lowerName, "_itemimage.png") {
-			pathParts := strings.Split(f.Name, "/")
-			for j, p := range pathParts {
-				pathParts[j] = url.PathEscape(p)
-			}
-			bestCoverURL = "https://archive.org/download/" + id + "/" + strings.Join(pathParts, "/")
-			break
+	// Archive.org has a hidden page-rendering API. We ask it to render the first page at 1000px width.
+	probeClient := &http.Client{Timeout: 5 * time.Second}
+	highResURLs := []string{
+		"https://archive.org/download/" + id + "/page/cover_w1000.jpg",
+		"https://archive.org/download/" + id + "/page/n0_w1000.jpg",
+		"https://archive.org/download/" + id + "/page/n1_w1000.jpg",
+	}
+
+	for _, testURL := range highResURLs {
+		req, _ := http.NewRequest("HEAD", testURL, nil)
+		resp, err := probeClient.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			bestCoverURL = testURL
+			break // We found a high-res first page, stop looking!
 		}
 	}
 
