@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -301,14 +302,19 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 		return
 	}
 
-	if action == "file" && len(parts) == 4 {
+	if (action == "file" || action == "comp") && len(parts) == 4 {
 		fileIdx, _ := strconv.Atoi(parts[3])
 		if fileIdx < 0 || fileIdx >= len(session.Files) {
 			return
 		}
 
 		f := session.Files[fileIdx]
-		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("📥 Preparing to download %s...", filepath.Ext(f.Name))))
+
+		msgText := fmt.Sprintf("📥 Preparing to download %s...", filepath.Ext(f.Name))
+		if action == "comp" {
+			msgText = "📥 Preparing to download & compress file..."
+		}
+		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, msgText))
 
 		pathParts := strings.Split(f.Name, "/")
 		for i, p := range pathParts {
@@ -320,7 +326,9 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 			DirectURL: "https://archive.org/download/" + session.ItemID + "/" + strings.Join(pathParts, "/"),
 		}
 
-		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book)
+		// Pass true if the user clicked "comp", pass false if they clicked "file"
+		shouldCompress := action == "comp"
+		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, shouldCompress)
 	}
 }
 
@@ -377,7 +385,7 @@ func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemN
 		return
 	}
 
-	runDownloadPipeline(bot, chatID, sentStatus.MessageID, book)
+	runDownloadPipeline(bot, chatID, sentStatus.MessageID, book, false)
 }
 
 func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
@@ -444,9 +452,19 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 		}
 
 		cbData := fmt.Sprintf("ar|file|%s|%d", sessionID, i)
-		keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
+
+		// Put the standard download button in the row
+		row := []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData(btnText, cbData),
-		))
+		}
+
+		// NEW: If it's a PDF and over 200MB, add a Compress button to the SAME row!
+		if sizeMB > 200 && strings.HasSuffix(lowerName, ".pdf") {
+			compCbData := fmt.Sprintf("ar|comp|%s|%d", sessionID, i)
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData("🗜 Compress", compCbData))
+		}
+
+		keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(row...))
 	}
 
 	// Remove the "Analyzing" message and send the menu
@@ -458,7 +476,7 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 	bot.Send(msg)
 }
 
-func runDownloadPipeline(bot *tgbotapi.BotAPI, chatID int64, msgID int, book *BookData) {
+func runDownloadPipeline(bot *tgbotapi.BotAPI, chatID int64, msgID int, book *BookData, shouldCompress bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	taskID := fmt.Sprintf("%d-%d", chatID, msgID)
 
@@ -486,6 +504,20 @@ func runDownloadPipeline(bot *tgbotapi.BotAPI, chatID int64, msgID int, book *Bo
 		return
 	}
 	defer os.RemoveAll(tmpDir)
+	// --- NEW: COMPRESSION LOGIC ---
+	if shouldCompress && filepath.Ext(bookPath) == ".pdf" {
+		editMessage(bot, chatID, msgID, "🗜 *Compressing PDF...*\nThis might take a minute depending on the file complexity.", taskID)
+
+		compressedPath := filepath.Join(tmpDir, "compressed_"+filepath.Base(bookPath))
+		err := compressPDF(bookPath, compressedPath)
+
+		if err == nil {
+			bookPath = compressedPath // Swap out the heavy file for the light one!
+		} else {
+			editMessage(bot, chatID, msgID, "⚠️ Compression failed! Uploading original size instead...", taskID)
+			time.Sleep(2 * time.Second) // Let them read the warning
+		}
+	}
 
 	editMessage(bot, chatID, msgID, "📤 Uploading file to Telegram...", taskID)
 
@@ -916,4 +948,21 @@ func startSessionCleaner() {
 		}
 		sessionMutex.Unlock()
 	}
+}
+
+// ---------------------------------------------------------
+// PDF COMPRESSION HELPER
+// ---------------------------------------------------------
+func compressPDF(inputPath, outputPath string) error {
+	cmd := exec.Command("gs",
+		"-sDEVICE=pdfwrite",
+		"-dCompatibilityLevel=1.4",
+		"-dPDFSETTINGS=/ebook",
+		"-dNOPAUSE",
+		"-dQUIET",
+		"-dBATCH",
+		"-sOutputFile="+outputPath,
+		inputPath,
+	)
+	return cmd.Run()
 }

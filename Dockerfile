@@ -25,7 +25,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /libgen-bot main.go
 FROM alpine:3.20
 
 # Install certificates so the bot can securely talk to Telegram and Libgen
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates ghostscript
 
 WORKDIR /root/
 
