@@ -412,6 +412,23 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 	}
 	json.NewDecoder(res.Body).Decode(&archiveRes)
 
+	// --- NEW: Find the High-Resolution Cover ---
+	bestCoverURL := "https://archive.org/services/img/" + id // Fallback to thumbnail
+	for _, f := range archiveRes.Files {
+		lowerFormat := strings.ToLower(f.Format)
+		lowerName := strings.ToLower(f.Name)
+
+		// Archive.org automatically generates an "Item Image" which is the high-res cover
+		if lowerFormat == "item image" || strings.HasSuffix(lowerName, "_itemimage.jpg") || strings.HasSuffix(lowerName, "_itemimage.png") {
+			pathParts := strings.Split(f.Name, "/")
+			for j, p := range pathParts {
+				pathParts[j] = url.PathEscape(p)
+			}
+			bestCoverURL = "https://archive.org/download/" + id + "/" + strings.Join(pathParts, "/")
+			break
+		}
+	}
+
 	// Create session
 	sessionID := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // Short unique ID
 	session := &ArchiveSession{
@@ -419,7 +436,7 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 		Title:     cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "title")),
 		Author:    cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "creator")),
 		Publisher: cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "publisher")),
-		CoverURL:  "https://archive.org/services/img/" + id,
+		CoverURL:  bestCoverURL,
 		Files:     archiveRes.Files,
 		CreatedAt: time.Now(),
 	}
@@ -681,6 +698,7 @@ func scrapeLibgen(pageURL string) (*BookData, error) {
 
 	doc.Find("div.col-xl-2 img").Each(func(i int, s *goquery.Selection) {
 		if src, exists := s.Attr("src"); exists && strings.Contains(src, "/covers/") {
+			src = strings.ReplaceAll(src, "_small/", "")
 			book.CoverURL = "https://libgen.li" + src
 		}
 	})
