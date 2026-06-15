@@ -68,6 +68,7 @@ type UserState struct {
 	State          string // "CONFIRM_OR_RENAME" or "AWAITING_RENAME"
 	PendingBook    *BookData
 	ShouldCompress bool
+	SessionID      string // NEW: Links to the Archive session
 	CreatedAt      time.Time
 }
 
@@ -351,6 +352,22 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 	chatID := query.Message.Chat.ID
 	go removeClickedButton(bot, query)
 
+	if action == "ren" {
+		userStateMutex.Lock()
+		userStates[query.Message.MessageID] = &UserState{
+			ChatID:    chatID,
+			State:     "AWAITING_ARCHIVE_RENAME",
+			SessionID: sessionID,
+			CreatedAt: time.Now(),
+		}
+		userStateMutex.Unlock()
+
+		msg := tgbotapi.NewMessage(chatID, "✏️ *Send me the new filename for this book:*\n*(Please do not include extensions like .pdf)*")
+		msg.ParseMode = "Markdown"
+		bot.Send(msg)
+		return
+	}
+
 	if action == "meta" {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
 		caption := fmt.Sprintf("📖 Title: %s\n👤 Author: %s\n🏢 Publisher: %s",
@@ -383,7 +400,9 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 		}
 
 		shouldCompress := action == "comp"
-		go promptForRename(bot, chatID, book, shouldCompress)
+		// --- CHANGED: Skip the double-prompt, go straight to the queue! ---
+		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ *Queued for download...*\nWaiting for available slot."))
+		jobQueue <- &DownloadJob{Bot: bot, ChatID: chatID, MsgID: statusMsg.MessageID, Book: book, ShouldCompress: shouldCompress}
 	}
 }
 
@@ -412,20 +431,35 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			return
 		}
 
-		activeState.PendingBook.Title = newName
-		book := activeState.PendingBook
-		comp := activeState.ShouldCompress
-
 		userStateMutex.Lock()
 		delete(userStates, activeMsgID)
 		userStateMutex.Unlock()
 
 		addReactions(bot, chatID, msg.MessageID, "🕊")
-		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Filename updated to `%s`", newName)))
 
-		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ *Queued for download...*\nWaiting for available slot."))
-		jobQueue <- &DownloadJob{Bot: bot, ChatID: chatID, MsgID: statusMsg.MessageID, Book: book, ShouldCompress: comp}
-		return
+		// If renaming an Archive menu item:
+		if activeState.State == "AWAITING_ARCHIVE_RENAME" {
+			sessionMutex.Lock()
+			if sess, ok := archiveSessions[activeState.SessionID]; ok {
+				sess.Title = newName
+			}
+			sessionMutex.Unlock()
+
+			bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Filename updated to `%s`!\n👉 *Now click a download button on the menu above.*", newName)))
+			return
+		}
+
+		// If renaming a Libgen/Direct link item:
+		if activeState.State == "AWAITING_LIBGEN_RENAME" {
+			activeState.PendingBook.Title = newName
+			book := activeState.PendingBook
+			comp := activeState.ShouldCompress
+
+			bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Filename updated to `%s`", newName)))
+			statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ *Queued for download...*\nWaiting for available slot."))
+			jobQueue <- &DownloadJob{Bot: bot, ChatID: chatID, MsgID: statusMsg.MessageID, Book: book, ShouldCompress: comp}
+			return
+		}
 	}
 
 	if msg.IsCommand() && msg.Command() == "start" {
@@ -562,6 +596,7 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 	var keyboard [][]tgbotapi.InlineKeyboardButton
 	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("🖼 Cover + Metadata", "ar|meta|"+sessionID),
+		tgbotapi.NewInlineKeyboardButtonData("✏️ Rename", "ar|ren|"+sessionID), // <-- NEW BUTTON
 	))
 
 	for i, f := range session.Files {
@@ -947,11 +982,17 @@ func compressPDF(inputPath, outputPath string) error {
 
 func promptForRename(bot *tgbotapi.BotAPI, chatID int64, book *BookData, shouldCompress bool) {
 	defaultName := sanitizeFilename(book.Title)
-	text := fmt.Sprintf("📄 *Ready to Download*\n\nExpected filename: `%s`\n\nDo you want to continue or rename it?", defaultName)
+
+	sizeText := ""
+	if book.Size > 0 {
+		sizeText = fmt.Sprintf("\nSize: %.2f MB", float64(book.Size)/(1024*1024))
+	}
+
+	text := fmt.Sprintf("📖 *%s*%s\n\nChoose an option below:", defaultName, sizeText)
 
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("✅ Confirm Download", "dl|confirm"),
+			tgbotapi.NewInlineKeyboardButtonData("📥 Download", "dl|confirm"), // Re-worded to feel like a standard menu
 			tgbotapi.NewInlineKeyboardButtonData("✏️ Rename", "dl|rename"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
@@ -1017,7 +1058,7 @@ func processDownloadCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery
 
 	if action == "rename" {
 		userStateMutex.Lock()
-		state.State = "AWAITING_RENAME"
+		state.State = "AWAITING_LIBGEN_RENAME"
 		userStateMutex.Unlock()
 
 		edit := tgbotapi.NewEditMessageText(chatID, msgID, "✏️ *Send me the new filename:*\n*(Please do not include extensions like .pdf)*")
