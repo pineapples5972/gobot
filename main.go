@@ -59,6 +59,21 @@ type ArchiveFileMeta struct {
 }
 
 // ---------------------------------------------------------
+// USER STATE CACHE (For Renaming)
+// ---------------------------------------------------------
+type UserState struct {
+	State          string // "CONFIRM_OR_RENAME" or "AWAITING_RENAME"
+	PendingBook    *BookData
+	ShouldCompress bool
+	CreatedAt      time.Time
+}
+
+var (
+	userStates     = make(map[int64]*UserState)
+	userStateMutex sync.Mutex
+)
+
+// ---------------------------------------------------------
 // TEXT HELPERS
 // ---------------------------------------------------------
 
@@ -265,6 +280,13 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		go processArchiveCallback(bot, query)
 		return
 	}
+
+	// --- NEW: Handle Download/Rename Buttons ---
+	if strings.HasPrefix(query.Data, "dl|") {
+		go processDownloadCallback(bot, query)
+		return
+	}
+
 }
 
 func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
@@ -328,13 +350,43 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 
 		// Pass true if the user clicked "comp", pass false if they clicked "file"
 		shouldCompress := action == "comp"
-		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, shouldCompress)
+		go promptForRename(bot, chatID, book, shouldCompress)
+
+		//go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, shouldCompress)
 	}
 }
 
 func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	userText := strings.TrimSpace(msg.Text)
+
+	// --- NEW: Intercept text if waiting for a rename ---
+	userStateMutex.Lock()
+	state, exists := userStates[chatID]
+	userStateMutex.Unlock()
+
+	if exists && state.State == "AWAITING_RENAME" {
+		newName := sanitizeFilename(userText)
+		if newName == "" {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ Invalid filename. Try typing it again:"))
+			return
+		}
+
+		// Update the book title, clear state, and launch!
+		state.PendingBook.Title = newName
+		book := state.PendingBook
+		comp := state.ShouldCompress
+
+		userStateMutex.Lock()
+		delete(userStates, chatID)
+		userStateMutex.Unlock()
+
+		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Filename updated to `%s`", newName)))
+		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "📥 Starting download..."))
+
+		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, comp)
+		return
+	}
 
 	if msg.IsCommand() && msg.Command() == "start" {
 		bot.Send(tgbotapi.NewMessage(chatID, "👋 Send me any links (Libgen, Archive.org, or Direct file links) and I will download them!"))
@@ -385,7 +437,11 @@ func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemN
 		return
 	}
 
-	runDownloadPipeline(bot, chatID, sentStatus.MessageID, book, false)
+	// --- CHANGED: Call prompt instead of pipeline ---
+	bot.Request(tgbotapi.NewDeleteMessage(chatID, sentStatus.MessageID))
+	promptForRename(bot, chatID, book, false)
+
+	// runDownloadPipeline(bot, chatID, sentStatus.MessageID, book, false)
 }
 
 func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
@@ -968,6 +1024,15 @@ func startSessionCleaner() {
 			}
 		}
 		sessionMutex.Unlock()
+
+		// Clean Rename State Cache
+		userStateMutex.Lock()
+		for id, state := range userStates {
+			if now.Sub(state.CreatedAt) > 1*time.Hour {
+				delete(userStates, id)
+			}
+		}
+		userStateMutex.Unlock()
 	}
 }
 
@@ -986,4 +1051,84 @@ func compressPDF(inputPath, outputPath string) error {
 		inputPath,
 	)
 	return cmd.Run()
+}
+
+// ---------------------------------------------------------
+// RENAMING & CONFIRMATION LOGIC
+// ---------------------------------------------------------
+func promptForRename(bot *tgbotapi.BotAPI, chatID int64, book *BookData, shouldCompress bool) {
+	defaultName := sanitizeFilename(book.Title)
+	text := fmt.Sprintf("📄 *Ready to Download*\n\nExpected filename: `%s`\n\nDo you want to continue or rename it?", defaultName)
+
+	userStateMutex.Lock()
+	userStates[chatID] = &UserState{
+		State:          "CONFIRM_OR_RENAME",
+		PendingBook:    book,
+		ShouldCompress: shouldCompress,
+		CreatedAt:      time.Now(),
+	}
+	userStateMutex.Unlock()
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Confirm Download", "dl|confirm"),
+			tgbotapi.NewInlineKeyboardButtonData("✏️ Rename", "dl|rename"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "dl|cancel"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = kb
+	bot.Send(msg)
+}
+
+func processDownloadCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
+	action := strings.TrimPrefix(query.Data, "dl|")
+	chatID := query.Message.Chat.ID
+
+	userStateMutex.Lock()
+	state, exists := userStates[chatID]
+	userStateMutex.Unlock()
+
+	if !exists || state.PendingBook == nil {
+		bot.Send(tgbotapi.NewMessage(chatID, "❌ Session expired. Please send the link again."))
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID))
+		return
+	}
+
+	if action == "cancel" {
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID))
+		userStateMutex.Lock()
+		delete(userStates, chatID)
+		userStateMutex.Unlock()
+		return
+	}
+
+	if action == "confirm" {
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID))
+
+		book := state.PendingBook
+		comp := state.ShouldCompress
+
+		userStateMutex.Lock()
+		delete(userStates, chatID)
+		userStateMutex.Unlock()
+
+		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "📥 Starting download..."))
+		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, comp)
+		return
+	}
+
+	if action == "rename" {
+		userStateMutex.Lock()
+		state.State = "AWAITING_RENAME"
+		userStateMutex.Unlock()
+
+		edit := tgbotapi.NewEditMessageText(chatID, query.Message.MessageID, "✏️ *Send me the new filename:*\n*(Please do not include extensions like .pdf)*")
+		edit.ParseMode = "Markdown"
+		bot.Send(edit)
+	}
 }
