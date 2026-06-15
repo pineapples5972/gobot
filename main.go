@@ -32,6 +32,7 @@ type BookData struct {
 	CoverURL    string
 	GatewayURL  string
 	DirectURL   string
+	Size        int64 // Used for queue management
 }
 
 // ---------------------------------------------------------
@@ -40,6 +41,7 @@ type BookData struct {
 var (
 	archiveSessions = make(map[string]*ArchiveSession)
 	sessionMutex    sync.Mutex
+	sessionCounter  uint64 // Prevents ID collisions on rapid multi-links
 )
 
 type ArchiveSession struct {
@@ -62,6 +64,7 @@ type ArchiveFileMeta struct {
 // USER STATE CACHE (For Renaming)
 // ---------------------------------------------------------
 type UserState struct {
+	ChatID         int64
 	State          string // "CONFIRM_OR_RENAME" or "AWAITING_RENAME"
 	PendingBook    *BookData
 	ShouldCompress bool
@@ -69,19 +72,72 @@ type UserState struct {
 }
 
 var (
-	userStates     = make(map[int64]*UserState)
+	userStates     = make(map[int]*UserState) // Keyed by prompt MsgID to allow multi-prompts
 	userStateMutex sync.Mutex
 )
 
 // ---------------------------------------------------------
-// TEXT HELPERS
+// DOWNLOAD QUEUE DISPATCHER
+// ---------------------------------------------------------
+type DownloadJob struct {
+	Bot            *tgbotapi.BotAPI
+	ChatID         int64
+	MsgID          int
+	Book           *BookData
+	ShouldCompress bool
+}
+
+var (
+	jobQueue    = make(chan *DownloadJob, 200)
+	activeJobs  int
+	activeBytes int64
+	jobMutex    sync.Mutex
+	jobCond     = sync.NewCond(&jobMutex)
+	MAX_JOBS    = 3
+	MAX_BYTES   = int64(800 * 1024 * 1024)
+)
+
+func startDispatcher() {
+	for job := range jobQueue {
+		jobMutex.Lock()
+
+		// Wait if we have 3 active jobs, OR if adding this job breaks the 800MB limit.
+		// (If activeJobs == 0, we bypass the byte limit to prevent deadlocks on massive files)
+		for activeJobs >= MAX_JOBS || (activeJobs > 0 && activeBytes+job.Book.Size > MAX_BYTES) {
+			jobCond.Wait()
+		}
+
+		activeJobs++
+		activeBytes += job.Book.Size
+		jobMutex.Unlock()
+
+		editMessage(job.Bot, job.ChatID, job.MsgID, "📥 *Starting download...*", "")
+
+		// Run the actual download in a separate worker routine
+		go func(j *DownloadJob) {
+			runDownloadPipeline(j.Bot, j.ChatID, j.MsgID, j.Book, j.ShouldCompress)
+
+			// When finished, release resources and wake up the dispatcher
+			jobMutex.Lock()
+			activeJobs--
+			activeBytes -= j.Book.Size
+			if activeBytes < 0 {
+				activeBytes = 0
+			}
+			jobCond.Broadcast()
+			jobMutex.Unlock()
+		}(job)
+	}
+}
+
+// ---------------------------------------------------------
+// TEXT HELPERS & CANCEL LOGIC
 // ---------------------------------------------------------
 
 func sanitizeFilename(name string) string {
 	re := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
 	clean := re.ReplaceAllString(name, "")
 
-	// FIX: Strip existing extensions so we don't get filename.pdf.pdf or filename.epub.epub
 	ext := filepath.Ext(clean)
 	if ext != "" {
 		clean = strings.TrimSuffix(clean, ext)
@@ -98,9 +154,6 @@ func formatArchiveSize(sizeStr string) float64 {
 	return bytes / (1024 * 1024)
 }
 
-// ---------------------------------------------------------
-// GLOBAL TASK MANAGER (For Cancellation)
-// ---------------------------------------------------------
 var (
 	activeTasks = make(map[string]context.CancelFunc)
 	taskMutex   sync.Mutex
@@ -115,9 +168,6 @@ func cancelKeyboard(taskID string) *tgbotapi.InlineKeyboardMarkup {
 	return &kb
 }
 
-// ---------------------------------------------------------
-// CANCELLABLE PROGRESS TRACKERS
-// ---------------------------------------------------------
 type DownloadProgress struct {
 	Ctx        context.Context
 	TaskID     string
@@ -149,7 +199,6 @@ func (dp *DownloadProgress) Write(p []byte) (int, error) {
 			if percent > 100 {
 				percent = 100
 			}
-
 			filled := int(percent / 10)
 			if filled < 0 {
 				filled = 0
@@ -158,7 +207,6 @@ func (dp *DownloadProgress) Write(p []byte) (int, error) {
 				filled = 10
 			}
 			bar := strings.Repeat("█", filled) + strings.Repeat("░", 10-filled)
-
 			text = fmt.Sprintf("📥 *Downloading File...*\n\n`%s` %.1f%%\n%.2f MB / %.2f MB", bar, percent, downloadedMB, totalMB)
 		} else {
 			text = fmt.Sprintf("📥 *Downloading File...*\n\n%.2f MB downloaded so far...", downloadedMB)
@@ -188,11 +236,9 @@ func (up *UploadProgress) Read(p []byte) (int, error) {
 	if err := up.Ctx.Err(); err != nil {
 		return 0, err
 	}
-
 	n, err := up.Reader.Read(p)
 	if n > 0 {
 		up.Uploaded += int64(n)
-
 		now := time.Now()
 		if now.Sub(up.LastUpdate) >= 4*time.Second {
 			up.LastUpdate = now
@@ -200,7 +246,6 @@ func (up *UploadProgress) Read(p []byte) (int, error) {
 			if percent > 100 {
 				percent = 100
 			}
-
 			filled := int(percent / 10)
 			if filled < 0 {
 				filled = 0
@@ -209,10 +254,8 @@ func (up *UploadProgress) Read(p []byte) (int, error) {
 				filled = 10
 			}
 			bar := strings.Repeat("█", filled) + strings.Repeat("░", 10-filled)
-
 			uploadedMB := float64(up.Uploaded) / (1024 * 1024)
 			totalMB := float64(up.TotalSize) / (1024 * 1024)
-
 			text := fmt.Sprintf("📤 *Uploading to Telegram...*\n\n`%s` %.1f%%\n%.2f MB / %.2f MB", bar, percent, uploadedMB, totalMB)
 
 			edit := tgbotapi.NewEditMessageText(up.ChatID, up.MsgID, text)
@@ -230,6 +273,8 @@ func (up *UploadProgress) Read(p []byte) (int, error) {
 
 func main() {
 	go startSessionCleaner()
+	go startDispatcher() // Start the Queue engine
+
 	botToken := os.Getenv("BOT_TOKEN")
 	if botToken == "" {
 		log.Panic("BOT_TOKEN environment variable is not set")
@@ -263,7 +308,6 @@ func main() {
 func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 	bot.Request(tgbotapi.NewCallback(query.ID, "Processing..."))
 
-	// Handle Cancellations
 	if strings.HasPrefix(query.Data, "cancel_") {
 		taskID := strings.TrimPrefix(query.Data, "cancel_")
 		taskMutex.Lock()
@@ -275,18 +319,15 @@ func handleCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	// Handle Archive.org Menu Buttons
 	if strings.HasPrefix(query.Data, "ar|") {
 		go processArchiveCallback(bot, query)
 		return
 	}
 
-	// --- NEW: Handle Download/Rename Buttons ---
 	if strings.HasPrefix(query.Data, "dl|") {
 		go processDownloadCallback(bot, query)
 		return
 	}
-
 }
 
 func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
@@ -308,17 +349,12 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 	}
 
 	chatID := query.Message.Chat.ID
-
-	// --- NEW: Remove the button they just clicked ---
 	go removeClickedButton(bot, query)
 
-	// Send the Cover and short metadata
 	if action == "meta" {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
-
 		caption := fmt.Sprintf("📖 Title: %s\n👤 Author: %s\n🏢 Publisher: %s",
 			session.Title, session.Author, session.Publisher)
-
 		photo.Caption = caption
 		bot.Send(photo)
 		return
@@ -337,16 +373,17 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 			pathParts[i] = url.PathEscape(p)
 		}
 
+		// Parse size to inform the Dispatcher limit
+		sizeBytes, _ := strconv.ParseInt(f.Size, 10, 64)
+
 		book := &BookData{
 			Title:     session.Title,
 			DirectURL: "https://archive.org/download/" + session.ItemID + "/" + strings.Join(pathParts, "/"),
+			Size:      sizeBytes,
 		}
 
-		// Pass true if the user clicked "comp", pass false if they clicked "file"
 		shouldCompress := action == "comp"
 		go promptForRename(bot, chatID, book, shouldCompress)
-
-		//go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, shouldCompress)
 	}
 }
 
@@ -355,33 +392,39 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	userText := strings.TrimSpace(msg.Text)
 
 	// --- INTERCEPT TEXT IF WAITING FOR A RENAME ---
+	var activeState *UserState
+	var activeMsgID int
+
 	userStateMutex.Lock()
-	state, exists := userStates[chatID]
+	for id, state := range userStates {
+		if state.ChatID == chatID && state.State == "AWAITING_RENAME" {
+			activeState = state
+			activeMsgID = id
+			break
+		}
+	}
 	userStateMutex.Unlock()
 
-	if exists && state.State == "AWAITING_RENAME" {
+	if activeState != nil {
 		newName := sanitizeFilename(userText)
 		if newName == "" {
 			bot.Send(tgbotapi.NewMessage(chatID, "❌ Invalid filename. Try typing it again:"))
 			return
 		}
 
-		// Update the book title, clear state, and launch!
-		state.PendingBook.Title = newName
-		book := state.PendingBook
-		comp := state.ShouldCompress
+		activeState.PendingBook.Title = newName
+		book := activeState.PendingBook
+		comp := activeState.ShouldCompress
 
 		userStateMutex.Lock()
-		delete(userStates, chatID)
+		delete(userStates, activeMsgID)
 		userStateMutex.Unlock()
 
-		// NEW: React to the user's rename message with the Dove emoji
 		addReactions(bot, chatID, msg.MessageID, "🕊")
-
 		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Filename updated to `%s`", newName)))
-		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "📥 Starting download..."))
 
-		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, comp)
+		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ *Queued for download...*\nWaiting for available slot."))
+		jobQueue <- &DownloadJob{Bot: bot, ChatID: chatID, MsgID: statusMsg.MessageID, Book: book, ShouldCompress: comp}
 		return
 	}
 
@@ -398,7 +441,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	// --- NEW: SCAN LINKS FOR REACTIONS ---
+	// --- SCAN LINKS FOR REACTIONS ---
 	var linkReactions []string
 	hasArchive, hasLibgen := false, false
 
@@ -412,10 +455,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			hasLibgen = true
 		}
 	}
-
-	// Apply the link reactions to the user's message
 	addReactions(bot, chatID, msg.MessageID, linkReactions...)
-	// -------------------------------------
 
 	for i, u := range urls {
 		go processSingleLink(bot, chatID, u, i+1)
@@ -423,13 +463,11 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 }
 
 func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemNum int) {
-	// 1. ROUTE ARCHIVE LINKS TO THE NEW INTERACTIVE MENU
 	if strings.Contains(linkURL, "archive.org/details/") {
 		handleArchiveMenu(bot, chatID, linkURL)
 		return
 	}
 
-	// 2. ROUTE LIBGEN/DIRECT LINKS NORMALLY
 	statusMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔍 Analyzing Link #%d...", itemNum))
 	sentStatus, err := bot.Send(statusMsg)
 	if err != nil {
@@ -445,7 +483,7 @@ func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemN
 		if unescaped, err := url.PathUnescape(filename); err == nil {
 			filename = unescaped
 		}
-		book = &BookData{Title: sanitizeFilename(filename), DirectURL: linkURL}
+		book = &BookData{Title: sanitizeFilename(filename), DirectURL: linkURL, Size: 0}
 	}
 
 	if err != nil {
@@ -453,11 +491,8 @@ func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemN
 		return
 	}
 
-	// --- CHANGED: Call prompt instead of pipeline ---
 	bot.Request(tgbotapi.NewDeleteMessage(chatID, sentStatus.MessageID))
 	promptForRename(bot, chatID, book, false)
-
-	// runDownloadPipeline(bot, chatID, sentStatus.MessageID, book, false)
 }
 
 func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
@@ -484,10 +519,7 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 	}
 	json.NewDecoder(res.Body).Decode(&archiveRes)
 
-	// --- NEW: Actively fetch the REAL first page of the book ---
-	bestCoverURL := "https://archive.org/services/img/" + id // Ultimate fallback
-
-	// Archive.org has a hidden page-rendering API. We ask it to render the first page at 1000px width.
+	bestCoverURL := "https://archive.org/services/img/" + id
 	probeClient := &http.Client{Timeout: 5 * time.Second}
 	highResURLs := []string{
 		"https://archive.org/download/" + id + "/page/cover_w1000.jpg",
@@ -500,12 +532,16 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 		resp, err := probeClient.Do(req)
 		if err == nil && resp.StatusCode == 200 {
 			bestCoverURL = testURL
-			break // We found a high-res first page, stop looking!
+			break
 		}
 	}
 
-	// Create session
-	sessionID := fmt.Sprintf("%x", time.Now().UnixNano())[:8] // Short unique ID
+	// Atomic counter for unique session IDs
+	sessionMutex.Lock()
+	sessionCounter++
+	sessionID := fmt.Sprintf("ar_%d", sessionCounter)
+	sessionMutex.Unlock()
+
 	session := &ArchiveSession{
 		ItemID:    id,
 		Title:     cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "title")),
@@ -523,10 +559,7 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 	archiveSessions[sessionID] = session
 	sessionMutex.Unlock()
 
-	// Build Interactive Keyboard
 	var keyboard [][]tgbotapi.InlineKeyboardButton
-
-	// Row 1: The single Metadata button
 	keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("🖼 Cover + Metadata", "ar|meta|"+sessionID),
 	))
@@ -544,24 +577,18 @@ func handleArchiveMenu(bot *tgbotapi.BotAPI, chatID int64, pageURL string) {
 		}
 
 		cbData := fmt.Sprintf("ar|file|%s|%d", sessionID, i)
-
-		// Put the standard download button in the row
 		row := []tgbotapi.InlineKeyboardButton{
 			tgbotapi.NewInlineKeyboardButtonData(btnText, cbData),
 		}
 
-		// NEW: If it's a PDF and over 200MB, add a Compress button to the SAME row!
 		if sizeMB > 200 && strings.HasSuffix(lowerName, ".pdf") {
 			compCbData := fmt.Sprintf("ar|comp|%s|%d", sessionID, i)
 			row = append(row, tgbotapi.NewInlineKeyboardButtonData("🗜 Compress", compCbData))
 		}
-
 		keyboard = append(keyboard, tgbotapi.NewInlineKeyboardRow(row...))
 	}
 
-	// Remove the "Analyzing" message and send the menu
 	bot.Request(tgbotapi.NewDeleteMessage(chatID, statusMsg.MessageID))
-
 	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("📖 *%s*\n\nChoose an option below:", session.Title))
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}
@@ -596,18 +623,16 @@ func runDownloadPipeline(bot *tgbotapi.BotAPI, chatID int64, msgID int, book *Bo
 		return
 	}
 	defer os.RemoveAll(tmpDir)
-	// --- NEW: COMPRESSION LOGIC ---
+
 	if shouldCompress && filepath.Ext(bookPath) == ".pdf" {
 		editMessage(bot, chatID, msgID, "🗜 *Compressing PDF...*\nThis might take a minute depending on the file complexity.", taskID)
-
 		compressedPath := filepath.Join(tmpDir, "compressed_"+filepath.Base(bookPath))
 		err := compressPDF(bookPath, compressedPath)
-
 		if err == nil {
-			bookPath = compressedPath // Swap out the heavy file for the light one!
+			bookPath = compressedPath
 		} else {
 			editMessage(bot, chatID, msgID, "⚠️ Compression failed! Uploading original size instead...", taskID)
-			time.Sleep(2 * time.Second) // Let them read the warning
+			time.Sleep(2 * time.Second)
 		}
 	}
 
@@ -644,97 +669,9 @@ func runDownloadPipeline(bot *tgbotapi.BotAPI, chatID int64, msgID int, book *Bo
 	editMessage(bot, chatID, msgID, "✅ Upload Complete!", "")
 }
 
-// ---------------------------------------------------------
-// ARCHIVE.ORG EXTRACTOR
-// ---------------------------------------------------------
-
-func getArchiveOrgData(pageURL string) (*BookData, error) {
-	parts := strings.Split(pageURL, "/details/")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("malformed archive.org URL")
-	}
-	id := strings.Split(strings.Split(parts[1], "/")[0], "?")[0]
-
-	apiURL := "https://archive.org/metadata/" + id
-	req, _ := http.NewRequest("GET", apiURL, nil)
-
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("network error: %v", err)
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("API rejected request (Status %d)", res.StatusCode)
-	}
-
-	// FIX: Properly separated struct tags so the JSON decoder can read the filenames!
-	var archiveRes struct {
-		Metadata map[string]interface{} `json:"metadata"`
-		Files    []struct {
-			Name   string `json:"name"`
-			Format string `json:"format"`
-		} `json:"files"`
-	}
-
-	if err := json.NewDecoder(res.Body).Decode(&archiveRes); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON (Item may be restricted or blocked)")
-	}
-
-	book := &BookData{CoverURL: "https://archive.org/services/img/" + id}
-	book.Title = cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "title"))
-	if book.Title == "" {
-		book.Title = "Archive_Item_" + id
-	}
-	book.Author = cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "creator"))
-	book.Year = cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "date"))
-	book.Publisher = cleanText(extractDynamicInterfaceField(archiveRes.Metadata, "publisher"))
-	book.Description = cleanText(stripHTML(extractDynamicInterfaceField(archiveRes.Metadata, "description")))
-
-	var fallbackFile string
-	for _, file := range archiveRes.Files {
-		lowerName := strings.ToLower(file.Name)
-		lowerFormat := strings.ToLower(file.Format)
-
-		if strings.HasSuffix(lowerName, ".pdf") || strings.HasSuffix(lowerName, ".epub") ||
-			strings.HasSuffix(lowerName, ".mobi") || strings.HasSuffix(lowerName, ".djvu") {
-
-			pathParts := strings.Split(file.Name, "/")
-			for i, p := range pathParts {
-				pathParts[i] = url.PathEscape(p)
-			}
-			encodedPath := strings.Join(pathParts, "/")
-			targetURL := "https://archive.org/download/" + id + "/" + encodedPath
-
-			if strings.HasSuffix(lowerName, ".pdf") && (strings.Contains(lowerFormat, "text pdf") || strings.Contains(lowerName, "_text.pdf")) {
-				fallbackFile = targetURL
-			} else {
-				book.DirectURL = targetURL
-				break
-			}
-		}
-	}
-
-	if book.DirectURL == "" && fallbackFile != "" {
-		book.DirectURL = fallbackFile
-	}
-	if book.DirectURL == "" {
-		return nil, fmt.Errorf("no readable file (PDF/EPUB/MOBI/DJVU) found in this archive")
-	}
-
-	return book, nil
-}
-
-// ---------------------------------------------------------
-// LIBGEN SCRAPER
-// ---------------------------------------------------------
-
 func scrapeLibgen(pageURL string) (*BookData, error) {
 	req, _ := http.NewRequest("GET", pageURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -750,7 +687,7 @@ func scrapeLibgen(pageURL string) (*BookData, error) {
 		return nil, err
 	}
 
-	book := &BookData{}
+	book := &BookData{Size: 0}
 	doc.Find("p").Each(func(i int, s *goquery.Selection) {
 		text := cleanText(s.Text())
 		if strings.HasPrefix(text, "Title:") {
@@ -797,10 +734,6 @@ func scrapeLibgen(pageURL string) (*BookData, error) {
 	return book, nil
 }
 
-// ---------------------------------------------------------
-// UNIFIED DOWNLOAD PIPELINE
-// ---------------------------------------------------------
-
 func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgID int, taskID string, book *BookData) (string, string, string, error) {
 	tmpDir, err := os.MkdirTemp("", "library_*")
 	if err != nil {
@@ -808,16 +741,12 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 	}
 
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{
-		Timeout: 180 * time.Second,
-		Jar:     jar,
-	}
+	client := &http.Client{Timeout: 180 * time.Second, Jar: jar}
 
 	var finalDownloadURL string
 
 	if book.DirectURL != "" {
 		finalDownloadURL = book.DirectURL
-		editMessage(bot, chatID, msgID, "📥 *Connecting to File Server...*", taskID)
 	} else {
 		req, _ := http.NewRequestWithContext(ctx, "GET", book.GatewayURL, nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -839,7 +768,6 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 				}
 			}
 		})
-
 		if finalDownloadURL == "" {
 			return tmpDir, "", "", fmt.Errorf("could not locate the 'GET' button")
 		}
@@ -849,7 +777,6 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 			}
 			finalDownloadURL = "https://libgen.li" + finalDownloadURL
 		}
-		editMessage(bot, chatID, msgID, "📥 *Requesting File Stream...*", taskID)
 	}
 
 	fileReq, _ := http.NewRequestWithContext(ctx, "GET", finalDownloadURL, nil)
@@ -890,12 +817,6 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 			ext = ".pdf"
 		} else if strings.Contains(contentType, "epub") {
 			ext = ".epub"
-		} else if strings.Contains(contentType, "mobi") {
-			ext = ".mobi"
-		} else if strings.Contains(contentType, "mp4") {
-			ext = ".mp4"
-		} else if strings.Contains(contentType, "zip") {
-			ext = ".zip"
 		}
 	}
 	if ext == "" {
@@ -910,43 +831,17 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 	}
 
 	progress := &DownloadProgress{
-		Ctx:        ctx,
-		TaskID:     taskID,
-		TotalSize:  fileResp.ContentLength,
-		Bot:        bot,
-		ChatID:     chatID,
-		MsgID:      msgID,
-		LastUpdate: time.Now(),
+		Ctx: ctx, TaskID: taskID, TotalSize: fileResp.ContentLength,
+		Bot: bot, ChatID: chatID, MsgID: msgID, LastUpdate: time.Now(),
 	}
-
 	_, err = io.Copy(bookFile, io.TeeReader(fileResp.Body, progress))
 	if err != nil {
 		return tmpDir, "", "", err
 	}
 
-	coverPath := ""
-	if book.CoverURL != "" {
-		imgReq, _ := http.NewRequestWithContext(ctx, "GET", book.CoverURL, nil)
-		imgReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		coverResp, err := client.Do(imgReq)
-
-		if err == nil && coverResp.StatusCode == 200 {
-			defer coverResp.Body.Close()
-			coverPath = filepath.Join(tmpDir, "cover.jpg")
-			coverFile, err := os.Create(coverPath)
-			if err == nil {
-				defer coverFile.Close()
-				io.Copy(coverFile, coverResp.Body)
-			}
-		}
-	}
-
-	return tmpDir, bookPath, coverPath, nil
+	return tmpDir, bookPath, "", nil
 }
 
-// ---------------------------------------------------------
-// TEXT HELPERS
-// ---------------------------------------------------------
 func extractDynamicInterfaceField(m map[string]interface{}, key string) string {
 	val, ok := m[key]
 	if !ok || val == nil {
@@ -963,10 +858,7 @@ func extractDynamicInterfaceField(m map[string]interface{}, key string) string {
 	return ""
 }
 
-func stripHTML(text string) string {
-	re := regexp.MustCompile(`<[^>]*>`)
-	return re.ReplaceAllString(text, "")
-}
+func stripHTML(text string) string { return regexp.MustCompile(`<[^>]*>`).ReplaceAllString(text, "") }
 
 func cleanText(text string) string {
 	text = strings.TrimSpace(text)
@@ -981,11 +873,9 @@ func cleanText(text string) string {
 func editMessage(bot *tgbotapi.BotAPI, chatID int64, msgID int, newText string, taskID string) {
 	edit := tgbotapi.NewEditMessageText(chatID, msgID, newText)
 	edit.ParseMode = "Markdown"
-
 	if taskID != "" {
 		edit.ReplyMarkup = cancelKeyboard(taskID)
 	}
-
 	_, _ = bot.Send(edit)
 }
 
@@ -993,83 +883,53 @@ func removeClickedButton(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 	if query.Message == nil || query.Message.ReplyMarkup == nil {
 		return
 	}
-
 	var newKeyboard [][]tgbotapi.InlineKeyboardButton
-
-	// Loop through existing rows
 	for _, row := range query.Message.ReplyMarkup.InlineKeyboard {
 		var newRow []tgbotapi.InlineKeyboardButton
-
-		// Loop through buttons in the row
 		for _, btn := range row {
-			// If the button's data matches what they just clicked, skip it!
 			if btn.CallbackData != nil && *btn.CallbackData == query.Data {
 				continue
 			}
 			newRow = append(newRow, btn)
 		}
-
-		// Only keep the row if it still has buttons left
 		if len(newRow) > 0 {
 			newKeyboard = append(newKeyboard, newRow)
 		}
 	}
-
-	// Update the message with the smaller keyboard
-	edit := tgbotapi.NewEditMessageReplyMarkup(
-		query.Message.Chat.ID,
-		query.Message.MessageID,
-		tgbotapi.InlineKeyboardMarkup{InlineKeyboard: newKeyboard},
-	)
+	edit := tgbotapi.NewEditMessageReplyMarkup(query.Message.Chat.ID, query.Message.MessageID, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: newKeyboard})
 	bot.Send(edit)
 }
 
-// ---------------------------------------------------------
-// REACTION HELPER
-// ---------------------------------------------------------
 func addReactions(bot *tgbotapi.BotAPI, chatID int64, msgID int, emojis ...string) {
 	if len(emojis) == 0 {
 		return
 	}
-
 	var reactions []map[string]string
 	for _, e := range emojis {
-		reactions = append(reactions, map[string]string{
-			"type":  "emoji",
-			"emoji": e,
-		})
+		reactions = append(reactions, map[string]string{"type": "emoji", "emoji": e})
 	}
-
 	params := tgbotapi.Params{
 		"chat_id":    strconv.FormatInt(chatID, 10),
 		"message_id": strconv.Itoa(msgID),
-		"is_big":     "true", // Triggers the on-screen animation!
+		"is_big":     "true",
 	}
-
 	reactionJSON, _ := json.Marshal(reactions)
 	params["reaction"] = string(reactionJSON)
-
 	bot.MakeRequest("setMessageReaction", params)
 }
 
-// ---------------------------------------------------------
-// MEMORY MANAGEMENT
-// ---------------------------------------------------------
 func startSessionCleaner() {
-	// Run this check every 1 hour
 	ticker := time.NewTicker(1 * time.Hour)
 	for range ticker.C {
-		sessionMutex.Lock()
 		now := time.Now()
+		sessionMutex.Lock()
 		for id, session := range archiveSessions {
-			// If the session is older than 2 hours, delete it to free RAM
 			if now.Sub(session.CreatedAt) > 2*time.Hour {
 				delete(archiveSessions, id)
 			}
 		}
 		sessionMutex.Unlock()
 
-		// Clean Rename State Cache
 		userStateMutex.Lock()
 		for id, state := range userStates {
 			if now.Sub(state.CreatedAt) > 1*time.Hour {
@@ -1080,38 +940,14 @@ func startSessionCleaner() {
 	}
 }
 
-// ---------------------------------------------------------
-// PDF COMPRESSION HELPER
-// ---------------------------------------------------------
 func compressPDF(inputPath, outputPath string) error {
-	cmd := exec.Command("gs",
-		"-sDEVICE=pdfwrite",
-		"-dCompatibilityLevel=1.4",
-		"-dPDFSETTINGS=/ebook",
-		"-dNOPAUSE",
-		"-dQUIET",
-		"-dBATCH",
-		"-sOutputFile="+outputPath,
-		inputPath,
-	)
+	cmd := exec.Command("gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4", "-dPDFSETTINGS=/ebook", "-dNOPAUSE", "-dQUIET", "-dBATCH", "-sOutputFile="+outputPath, inputPath)
 	return cmd.Run()
 }
 
-// ---------------------------------------------------------
-// RENAMING & CONFIRMATION LOGIC
-// ---------------------------------------------------------
 func promptForRename(bot *tgbotapi.BotAPI, chatID int64, book *BookData, shouldCompress bool) {
 	defaultName := sanitizeFilename(book.Title)
 	text := fmt.Sprintf("📄 *Ready to Download*\n\nExpected filename: `%s`\n\nDo you want to continue or rename it?", defaultName)
-
-	userStateMutex.Lock()
-	userStates[chatID] = &UserState{
-		State:          "CONFIRM_OR_RENAME",
-		PendingBook:    book,
-		ShouldCompress: shouldCompress,
-		CreatedAt:      time.Now(),
-	}
-	userStateMutex.Unlock()
 
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -1126,43 +962,56 @@ func promptForRename(bot *tgbotapi.BotAPI, chatID int64, book *BookData, shouldC
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
 	msg.ReplyMarkup = kb
-	bot.Send(msg)
+	sentMsg, err := bot.Send(msg)
+	if err != nil {
+		return
+	}
+
+	userStateMutex.Lock()
+	userStates[sentMsg.MessageID] = &UserState{
+		ChatID:         chatID,
+		State:          "CONFIRM_OR_RENAME",
+		PendingBook:    book,
+		ShouldCompress: shouldCompress,
+		CreatedAt:      time.Now(),
+	}
+	userStateMutex.Unlock()
 }
 
 func processDownloadCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 	action := strings.TrimPrefix(query.Data, "dl|")
 	chatID := query.Message.Chat.ID
+	msgID := query.Message.MessageID
 
 	userStateMutex.Lock()
-	state, exists := userStates[chatID]
+	state, exists := userStates[msgID]
 	userStateMutex.Unlock()
 
 	if !exists || state.PendingBook == nil {
 		bot.Send(tgbotapi.NewMessage(chatID, "❌ Session expired. Please send the link again."))
-		bot.Request(tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID))
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, msgID))
 		return
 	}
 
 	if action == "cancel" {
-		bot.Request(tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID))
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, msgID))
 		userStateMutex.Lock()
-		delete(userStates, chatID)
+		delete(userStates, msgID)
 		userStateMutex.Unlock()
 		return
 	}
 
 	if action == "confirm" {
-		bot.Request(tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID))
-
+		bot.Request(tgbotapi.NewDeleteMessage(chatID, msgID))
 		book := state.PendingBook
 		comp := state.ShouldCompress
 
 		userStateMutex.Lock()
-		delete(userStates, chatID)
+		delete(userStates, msgID)
 		userStateMutex.Unlock()
 
-		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "📥 Starting download..."))
-		go runDownloadPipeline(bot, chatID, statusMsg.MessageID, book, comp)
+		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "⏳ *Queued for download...*\nWaiting for available slot."))
+		jobQueue <- &DownloadJob{Bot: bot, ChatID: chatID, MsgID: statusMsg.MessageID, Book: book, ShouldCompress: comp}
 		return
 	}
 
@@ -1171,7 +1020,7 @@ func processDownloadCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery
 		state.State = "AWAITING_RENAME"
 		userStateMutex.Unlock()
 
-		edit := tgbotapi.NewEditMessageText(chatID, query.Message.MessageID, "✏️ *Send me the new filename:*\n*(Please do not include extensions like .pdf)*")
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, "✏️ *Send me the new filename:*\n*(Please do not include extensions like .pdf)*")
 		edit.ParseMode = "Markdown"
 		bot.Send(edit)
 	}
