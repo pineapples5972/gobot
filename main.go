@@ -332,12 +332,6 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 
 		f := session.Files[fileIdx]
 
-		msgText := fmt.Sprintf("📥 Preparing to download %s...", filepath.Ext(f.Name))
-		if action == "comp" {
-			msgText = "📥 Preparing to download & compress file..."
-		}
-		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, msgText))
-
 		pathParts := strings.Split(f.Name, "/")
 		for i, p := range pathParts {
 			pathParts[i] = url.PathEscape(p)
