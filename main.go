@@ -354,7 +354,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	userText := strings.TrimSpace(msg.Text)
 
-	// --- NEW: Intercept text if waiting for a rename ---
+	// --- INTERCEPT TEXT IF WAITING FOR A RENAME ---
 	userStateMutex.Lock()
 	state, exists := userStates[chatID]
 	userStateMutex.Unlock()
@@ -375,6 +375,9 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		delete(userStates, chatID)
 		userStateMutex.Unlock()
 
+		// NEW: React to the user's rename message with the Dove emoji
+		addReactions(bot, chatID, msg.MessageID, "🕊")
+
 		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Filename updated to `%s`", newName)))
 		statusMsg, _ := bot.Send(tgbotapi.NewMessage(chatID, "📥 Starting download..."))
 
@@ -394,6 +397,25 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		bot.Send(tgbotapi.NewMessage(chatID, "❌ No valid HTTP/HTTPS links found."))
 		return
 	}
+
+	// --- NEW: SCAN LINKS FOR REACTIONS ---
+	var linkReactions []string
+	hasArchive, hasLibgen := false, false
+
+	for _, u := range urls {
+		if strings.Contains(u, "archive.org") && !hasArchive {
+			linkReactions = append(linkReactions, "🤝")
+			hasArchive = true
+		}
+		if strings.Contains(u, "libgen") && !hasLibgen {
+			linkReactions = append(linkReactions, "⚡")
+			hasLibgen = true
+		}
+	}
+
+	// Apply the link reactions to the user's message
+	addReactions(bot, chatID, msg.MessageID, linkReactions...)
+	// -------------------------------------
 
 	for i, u := range urls {
 		go processSingleLink(bot, chatID, u, i+1)
@@ -1000,6 +1022,34 @@ func removeClickedButton(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 		tgbotapi.InlineKeyboardMarkup{InlineKeyboard: newKeyboard},
 	)
 	bot.Send(edit)
+}
+
+// ---------------------------------------------------------
+// REACTION HELPER
+// ---------------------------------------------------------
+func addReactions(bot *tgbotapi.BotAPI, chatID int64, msgID int, emojis ...string) {
+	if len(emojis) == 0 {
+		return
+	}
+
+	var reactions []map[string]string
+	for _, e := range emojis {
+		reactions = append(reactions, map[string]string{
+			"type":  "emoji",
+			"emoji": e,
+		})
+	}
+
+	params := tgbotapi.Params{
+		"chat_id":    strconv.FormatInt(chatID, 10),
+		"message_id": strconv.Itoa(msgID),
+		"is_big":     "true", // Triggers the on-screen animation!
+	}
+
+	reactionJSON, _ := json.Marshal(reactions)
+	params["reaction"] = string(reactionJSON)
+
+	bot.MakeRequest("setMessageReaction", params)
 }
 
 // ---------------------------------------------------------
