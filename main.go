@@ -416,7 +416,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	userStateMutex.Lock()
 	for id, state := range userStates {
-		if state.ChatID == chatID && state.State == "AWAITING_RENAME" {
+		if state.ChatID == chatID && (state.State == "AWAITING_ARCHIVE_RENAME" || state.State == "AWAITING_LIBGEN_RENAME") {
 			activeState = state
 			activeMsgID = id
 			break
