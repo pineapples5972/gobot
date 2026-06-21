@@ -221,6 +221,42 @@ func (dp *DownloadProgress) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// ---------------------------------------------------------
+// URL UN-SHORTENER
+// ---------------------------------------------------------
+func resolveShortLink(linkURL string) string {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	// First try a lightweight HEAD request
+	req, err := http.NewRequest("HEAD", linkURL, nil)
+	if err != nil {
+		return linkURL
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// If HEAD fails, fallback to a standard GET request
+		req, _ = http.NewRequest("GET", linkURL, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		resp, err = client.Do(req)
+		if err != nil {
+			return linkURL // Return original if totally unreachable
+		}
+	}
+	defer resp.Body.Close()
+
+	return resp.Request.URL.String() // Return the final, unfurled URL!
+}
+
 type UploadProgress struct {
 	Ctx        context.Context
 	TaskID     string
@@ -473,6 +509,11 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	if len(urls) == 0 {
 		bot.Send(tgbotapi.NewMessage(chatID, "❌ No valid HTTP/HTTPS links found."))
 		return
+	}
+
+	// --- NEW: EXPAND SHORTENED LINKS ---
+	for i, u := range urls {
+		urls[i] = resolveShortLink(u)
 	}
 
 	// --- SCAN LINKS FOR REACTIONS ---
