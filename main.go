@@ -222,11 +222,22 @@ func (dp *DownloadProgress) Write(p []byte) (int, error) {
 }
 
 // ---------------------------------------------------------
-// URL UN-SHORTENER
+// URL UN-SHORTENER & REDIRECT RESOLVER
 // ---------------------------------------------------------
 func resolveShortLink(linkURL string) string {
+	// 1. Quick check for direct URL parameters (Google Search redirects)
+	if parsed, err := url.Parse(linkURL); err == nil {
+		q := parsed.Query()
+		if target := q.Get("q"); target != "" {
+			return target
+		}
+		if target := q.Get("url"); target != "" {
+			return target
+		}
+	}
+
 	client := &http.Client{
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("too many redirects")
@@ -235,26 +246,57 @@ func resolveShortLink(linkURL string) string {
 		},
 	}
 
-	// First try a lightweight HEAD request
-	req, err := http.NewRequest("HEAD", linkURL, nil)
+	// Skip HEAD and use GET right away, spoofing a real browser to bypass blockers
+	req, err := http.NewRequest("GET", linkURL, nil)
 	if err != nil {
 		return linkURL
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		// If HEAD fails, fallback to a standard GET request
-		req, _ = http.NewRequest("GET", linkURL, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		resp, err = client.Do(req)
-		if err != nil {
-			return linkURL // Return original if totally unreachable
-		}
+		return linkURL
 	}
 	defer resp.Body.Close()
 
-	return resp.Request.URL.String() // Return the final, unfurled URL!
+	finalURL := resp.Request.URL.String()
+
+	// 2. HTML-Based Redirect Fallback (For share.google, Meta-Refresh, etc.)
+	// If the URL didn't change via HTTP headers, parse the HTML to find the hidden redirect!
+	if finalURL == linkURL || strings.Contains(finalURL, "google.com") || strings.Contains(finalURL, "share.google") {
+		doc, err := goquery.NewDocumentFromReader(resp.Body)
+		if err == nil {
+			// A. Look for standard Meta Refresh tags
+			if refresh, exists := doc.Find("meta[http-equiv='refresh']").Attr("content"); exists {
+				re := regexp.MustCompile(`(?i)url=['"]?(http[^'"]+)['"]?`)
+				match := re.FindStringSubmatch(refresh)
+				if len(match) > 1 {
+					return match[1]
+				}
+			}
+
+			// B. Look for JavaScript window.location redirects
+			doc.Find("script").Each(func(i int, s *goquery.Selection) {
+				re := regexp.MustCompile(`window\.location\.(?:replace|href)\s*=\s*['"](http[^'"]+)['"]`)
+				match := re.FindStringSubmatch(s.Text())
+				if len(match) > 1 {
+					finalURL = match[1]
+				}
+			})
+
+			// C. Look for Google's specific "Redirect Notice" anchor link
+			doc.Find("a").Each(func(i int, s *goquery.Selection) {
+				if href, exists := s.Attr("href"); exists {
+					if strings.Contains(href, "archive.org") || strings.Contains(href, "libgen") {
+						finalURL = href
+					}
+				}
+			})
+		}
+	}
+
+	return finalURL
 }
 
 type UploadProgress struct {
