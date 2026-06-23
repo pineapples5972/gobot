@@ -448,7 +448,7 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 
 	if action == "meta" {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
-		caption := fmt.Sprintf("📖 Title: %s\n👤 Author: %s\n🏢 Publisher: %s",
+		caption := fmt.Sprintf("%s\n %s\n %s",
 			session.Title, session.Author, session.Publisher)
 		photo.Caption = caption
 		bot.Send(photo)
@@ -555,6 +555,10 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	// --- NEW: EXPAND SHORTENED LINKS ---
 	for i, u := range urls {
+		// Bypass the un-shortener if it is already a standard direct link!
+		if strings.Contains(u, "archive.org/details/") || strings.Contains(u, "libgen.") {
+			continue
+		}
 		urls[i] = resolveShortLink(u)
 	}
 
