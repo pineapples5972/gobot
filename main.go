@@ -232,7 +232,7 @@ func (dp *DownloadProgress) Write(p []byte) (int, error) {
 // URL UN-SHORTENER & REDIRECT RESOLVER
 // ---------------------------------------------------------
 func resolveShortLink(linkURL string) string {
-	// 1. Quick check for direct URL parameters (Google Search redirects)
+	// 1. Direct URL parameters
 	if parsed, err := url.Parse(linkURL); err == nil {
 		q := parsed.Query()
 		if target := q.Get("q"); target != "" {
@@ -253,13 +253,11 @@ func resolveShortLink(linkURL string) string {
 		},
 	}
 
-	// Skip HEAD and use GET right away, spoofing a real browser to bypass blockers
 	req, err := http.NewRequest("GET", linkURL, nil)
 	if err != nil {
 		return linkURL
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -269,37 +267,28 @@ func resolveShortLink(linkURL string) string {
 
 	finalURL := resp.Request.URL.String()
 
-	// 2. HTML-Based Redirect Fallback (For share.google, Meta-Refresh, etc.)
-	// If the URL didn't change via HTTP headers, parse the HTML to find the hidden redirect!
-	if finalURL == linkURL || strings.Contains(finalURL, "google.com") || strings.Contains(finalURL, "share.google") {
-		doc, err := goquery.NewDocumentFromReader(resp.Body)
-		if err == nil {
-			// A. Look for standard Meta Refresh tags
-			if refresh, exists := doc.Find("meta[http-equiv='refresh']").Attr("content"); exists {
-				re := regexp.MustCompile(`(?i)url=['"]?(http[^'"]+)['"]?`)
-				match := re.FindStringSubmatch(refresh)
-				if len(match) > 1 {
-					return match[1]
-				}
-			}
+	// If HTTP redirect successfully found our target, return it immediately
+	if strings.Contains(finalURL, "archive.org/details/") || strings.Contains(finalURL, "libgen.") {
+		return finalURL
+	}
 
-			// B. Look for JavaScript window.location redirects
-			doc.Find("script").Each(func(i int, s *goquery.Selection) {
-				re := regexp.MustCompile(`window\.location\.(?:replace|href)\s*=\s*['"](http[^'"]+)['"]`)
-				match := re.FindStringSubmatch(s.Text())
-				if len(match) > 1 {
-					finalURL = match[1]
-				}
-			})
+	// 2. BRUTE-FORCE TEXT EXTRACTION
+	// Firebase (share.google) hides URLs deep inside Minified Javascript JSON.
+	// We bypass HTML parsing entirely and sweep the raw network data.
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err == nil {
+		bodyStr := string(bodyBytes)
 
-			// C. Look for Google's specific "Redirect Notice" anchor link
-			doc.Find("a").Each(func(i int, s *goquery.Selection) {
-				if href, exists := s.Attr("href"); exists {
-					if strings.Contains(href, "archive.org") || strings.Contains(href, "libgen") {
-						finalURL = href
-					}
-				}
-			})
+		// Hunt for the literal Archive/Libgen URL anywhere in the raw data stream
+		re := regexp.MustCompile(`https?://(?:www\.)?(archive\.org/details/[^\s"'\\<]+|libgen\.[a-z]+/[^\s"'\\<]+)`)
+		if match := re.FindString(bodyStr); match != "" {
+			return match
+		}
+
+		// Fallback: Check for standard Meta Refresh redirect
+		refreshRe := regexp.MustCompile(`(?i)url=['"]?(https?://[^'"]+)['"]?`)
+		if match := refreshRe.FindStringSubmatch(bodyStr); len(match) > 1 {
+			return match[1]
 		}
 	}
 
