@@ -139,9 +139,16 @@ func sanitizeFilename(name string) string {
 	re := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
 	clean := re.ReplaceAllString(name, "")
 
-	ext := filepath.Ext(clean)
-	if ext != "" {
-		clean = strings.TrimSuffix(clean, ext)
+	// FIX: Only strip actual file extensions, don't strip text after a dot like "Vol. 1"
+	lowerClean := strings.ToLower(clean)
+	knownExtensions := []string{".pdf", ".epub", ".mobi", ".djvu", ".zip", ".cbz", ".cbr", ".mp4"}
+
+	for _, ext := range knownExtensions {
+		if strings.HasSuffix(lowerClean, ext) {
+			// Trim the extension off the original (case-preserving) string
+			clean = clean[:len(clean)-len(ext)]
+			break
+		}
 	}
 
 	if len(clean) > 80 {
@@ -448,7 +455,7 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 
 	if action == "meta" {
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
-		caption := fmt.Sprintf("%s\n %s\n %s",
+		caption := fmt.Sprintf("%s\n%s\n%s",
 			session.Title, session.Author, session.Publisher)
 		photo.Caption = caption
 		bot.Send(photo)
