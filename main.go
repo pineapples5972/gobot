@@ -443,11 +443,17 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 	}
 
 	if action == "meta" {
+		caption := fmt.Sprintf("📖 %s\n👤 %s\n🏢 %s", session.Title, session.Author, session.Publisher)
+
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
-		caption := fmt.Sprintf("%s\n%s\n%s",
-			session.Title, session.Author, session.Publisher)
 		photo.Caption = caption
-		bot.Send(photo)
+
+		_, err := bot.Send(photo)
+		if err != nil {
+			// Safety Net: If Telegram's server rejects the image URL, send text instead!
+			fallbackMsg := tgbotapi.NewMessage(chatID, "🖼 *(Cover image unavailable)*\n\n"+caption)
+			bot.Send(fallbackMsg)
+		}
 		return
 	}
 
