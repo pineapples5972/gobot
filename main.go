@@ -443,7 +443,7 @@ func processArchiveCallback(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery)
 	}
 
 	if action == "meta" {
-		caption := fmt.Sprintf("📖 %s\n👤 %s\n🏢 %s", session.Title, session.Author, session.Publisher)
+		caption := fmt.Sprintf("%s\n%s\n%s", session.Title, session.Author, session.Publisher)
 
 		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(session.CoverURL))
 		photo.Caption = caption
