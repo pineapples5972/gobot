@@ -613,24 +613,24 @@ func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemN
 		return
 	}
 
-	// --- NEW: Intercept Google Drive links before the normal pipeline ---
+	// --- NEW: Intercept Google Drive links and push to download pipeline ---
 	if strings.Contains(linkURL, "drive.google.com") {
 		directLink, success := parseGoogleDriveLink(linkURL)
 		if success {
-			var keyboard = tgbotapi.NewInlineKeyboardMarkup(
-				tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonURL("🚀 Direct Download", directLink),
-				),
-			)
+			// We don't have an API to fetch the exact filename from GDrive,
+			// so we set a placeholder. The user can fix it in the Rename prompt!
+			book := &BookData{
+				Title:     "Google_Drive_File",
+				DirectURL: directLink,
+				Size:      0,
+			}
 
-			msg := tgbotapi.NewMessage(chatID, "📁 *Google Drive File Detected*\n\nYou can download the file directly using the button below:")
-			msg.ParseMode = "Markdown"
-			msg.ReplyMarkup = keyboard
-			bot.Send(msg)
+			// Send it straight to the standard download/rename queue
+			promptForRename(bot, chatID, book, false)
 		} else {
 			bot.Send(tgbotapi.NewMessage(chatID, "❌ Could not extract Google Drive File ID."))
 		}
-		return // Stop processing so it doesn't trigger a rename prompt!
+		return // Stop processing so it doesn't run the Libgen scraper
 	}
 	// -------------------------------------------------------------------
 
