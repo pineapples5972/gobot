@@ -157,20 +157,20 @@ func sanitizeFilename(name string) string {
 	return strings.TrimSpace(clean)
 }
 
-// Extracts the File ID from a Google Drive link and returns a direct download URL
-func parseGoogleDriveLink(linkURL string) (string, bool) {
-	// Regex to match typical GDrive file sharing URL patterns
+// Extracts the File ID from a Google Drive link and returns a direct download URL and a cover URL
+func parseGoogleDriveLink(linkURL string) (string, string, bool) {
 	re := regexp.MustCompile(`drive\.google\.com/file/d/([a-zA-Z0-9_-]+)`)
 	match := re.FindStringSubmatch(linkURL)
 
 	if len(match) > 1 {
 		fileID := match[1]
-		// Construct the direct download link format that bypasses the web UI viewer
 		directDownloadURL := fmt.Sprintf("https://docs.google.com/uc?export=download&id=%s", fileID)
-		return directDownloadURL, true
+		// Hidden API to extract a high-res cover image from Google Drive files!
+		coverURL := fmt.Sprintf("https://drive.google.com/thumbnail?id=%s&sz=w1000", fileID)
+		return directDownloadURL, coverURL, true
 	}
 
-	return "", false
+	return "", "", false
 }
 
 func formatArchiveSize(sizeStr string) float64 {
@@ -615,13 +615,12 @@ func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemN
 
 	// --- NEW: Intercept Google Drive links and push to download pipeline ---
 	if strings.Contains(linkURL, "drive.google.com") {
-		directLink, success := parseGoogleDriveLink(linkURL)
+		directLink, coverLink, success := parseGoogleDriveLink(linkURL)
 		if success {
-			// We don't have an API to fetch the exact filename from GDrive,
-			// so we set a placeholder. The user can fix it in the Rename prompt!
 			book := &BookData{
 				Title:     "Google_Drive_File",
 				DirectURL: directLink,
+				CoverURL:  coverLink, // Attach the extracted cover image!
 				Size:      0,
 			}
 
@@ -956,7 +955,52 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 	if err != nil {
 		return tmpDir, "", "", err
 	}
-	defer fileResp.Body.Close()
+
+	// --- NEW: GOOGLE DRIVE VIRUS SCAN BYPASS ---
+	// If Google serves us the 2.4KB HTML warning page instead of the actual file stream:
+	if strings.Contains(finalDownloadURL, "docs.google.com") && strings.Contains(fileResp.Header.Get("Content-Type"), "text/html") {
+		doc, err := goquery.NewDocumentFromReader(fileResp.Body)
+		fileResp.Body.Close() // Close the HTML body immediately
+
+		if err == nil {
+			var confirmURL string
+			// Hunt for the hidden "Download anyway" confirmation URL
+			if action, exists := doc.Find("#downloadForm").Attr("action"); exists {
+				confirmURL = action
+			} else if action, exists := doc.Find("form").Attr("action"); exists {
+				confirmURL = action
+			} else if href, exists := doc.Find("#uc-download-link").Attr("href"); exists {
+				confirmURL = href
+			} else {
+				// Brute-force regex scrape
+				htmlStr, _ := doc.Html()
+				re := regexp.MustCompile(`href=['"](/uc\?export=download[^'"]+confirm=[^'"]+)['"]`)
+				if match := re.FindStringSubmatch(htmlStr); len(match) > 1 {
+					confirmURL = match[1]
+				}
+			}
+
+			if confirmURL != "" {
+				if strings.HasPrefix(confirmURL, "/") {
+					confirmURL = "https://docs.google.com" + strings.ReplaceAll(confirmURL, "&amp;", "&")
+				}
+
+				// Fire a SECOND request to the actual confirmation link to rip the file
+				fileReq2, _ := http.NewRequestWithContext(ctx, "GET", confirmURL, nil)
+				fileReq2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+				fileResp, err = client.Do(fileReq2) // Overwrite fileResp with the real file stream
+				if err != nil {
+					return tmpDir, "", "", err
+				}
+				finalDownloadURL = confirmURL // Update URL so the extension extractor below works properly
+			} else {
+				return tmpDir, "", "", fmt.Errorf("could not bypass Google Drive warning page")
+			}
+		}
+	}
+	defer fileResp.Body.Close() // Ensure whatever stream is currently open gets safely closed
+	// -------------------------------------------
 
 	if fileResp.StatusCode != 200 {
 		return tmpDir, "", "", fmt.Errorf("server rejected request: Status %d", fileResp.StatusCode)
@@ -1124,7 +1168,7 @@ func promptForRename(bot *tgbotapi.BotAPI, chatID int64, book *BookData, shouldC
 
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📥 Download", "dl|confirm"), // Re-worded to feel like a standard menu
+			tgbotapi.NewInlineKeyboardButtonData("📥 Download", "dl|confirm"),
 			tgbotapi.NewInlineKeyboardButtonData("✏️ Rename", "dl|rename"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
@@ -1132,10 +1176,30 @@ func promptForRename(bot *tgbotapi.BotAPI, chatID int64, book *BookData, shouldC
 		),
 	)
 
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = kb
-	sentMsg, err := bot.Send(msg)
+	var sentMsg tgbotapi.Message
+	var err error
+
+	// NEW: If we have a cover URL, try to send it as a beautiful Photo Menu!
+	if book.CoverURL != "" {
+		photo := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(book.CoverURL))
+		photo.Caption = text
+		photo.ParseMode = "Markdown"
+		photo.ReplyMarkup = kb
+		sentMsg, err = bot.Send(photo)
+	}
+
+	// Safety Net: If CoverURL is empty OR if Telegram failed to download the image
+	if book.CoverURL == "" || err != nil {
+		fallbackText := text
+		if book.CoverURL != "" {
+			fallbackText = "🖼 *(Cover image unavailable)*\n\n" + text
+		}
+		msg := tgbotapi.NewMessage(chatID, fallbackText)
+		msg.ParseMode = "Markdown"
+		msg.ReplyMarkup = kb
+		sentMsg, err = bot.Send(msg)
+	}
+
 	if err != nil {
 		return
 	}
