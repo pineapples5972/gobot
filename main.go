@@ -158,14 +158,15 @@ func sanitizeFilename(name string) string {
 }
 
 // Extracts the File ID from a Google Drive link and returns a direct download URL and a cover URL
+// Extracts the File ID from a Google Drive link and returns a direct download URL and a cover URL
 func parseGoogleDriveLink(linkURL string) (string, string, bool) {
 	re := regexp.MustCompile(`drive\.google\.com/file/d/([a-zA-Z0-9_-]+)`)
 	match := re.FindStringSubmatch(linkURL)
 
 	if len(match) > 1 {
 		fileID := match[1]
-		directDownloadURL := fmt.Sprintf("https://docs.google.com/uc?export=download&id=%s", fileID)
-		// Hidden API to extract a high-res cover image from Google Drive files!
+		// Changed to drive.google.com to keep cookies perfectly synced!
+		directDownloadURL := fmt.Sprintf("https://drive.google.com/uc?export=download&id=%s", fileID)
 		coverURL := fmt.Sprintf("https://drive.google.com/thumbnail?id=%s&sz=w1000", fileID)
 		return directDownloadURL, coverURL, true
 	}
@@ -957,22 +958,22 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 	}
 
 	// --- NEW: GOOGLE DRIVE VIRUS SCAN BYPASS ---
-	// If Google serves us the 2.4KB HTML warning page instead of the actual file stream:
-	if strings.Contains(finalDownloadURL, "docs.google.com") && strings.Contains(fileResp.Header.Get("Content-Type"), "text/html") {
+	// If Google serves us the HTML warning page instead of the actual file stream:
+	if (strings.Contains(finalDownloadURL, "docs.google.com") || strings.Contains(finalDownloadURL, "drive.google.com")) && strings.Contains(fileResp.Header.Get("Content-Type"), "text/html") {
 		doc, err := goquery.NewDocumentFromReader(fileResp.Body)
-		fileResp.Body.Close() // Close the HTML body immediately
+		fileResp.Body.Close() // Close early
 
 		if err == nil {
 			var confirmURL string
-			// Hunt for the hidden "Download anyway" confirmation URL
 			if action, exists := doc.Find("#downloadForm").Attr("action"); exists {
+				confirmURL = action
+			} else if action, exists := doc.Find("#download-form").Attr("action"); exists { // Added alternative ID
 				confirmURL = action
 			} else if action, exists := doc.Find("form").Attr("action"); exists {
 				confirmURL = action
 			} else if href, exists := doc.Find("#uc-download-link").Attr("href"); exists {
 				confirmURL = href
 			} else {
-				// Brute-force regex scrape
 				htmlStr, _ := doc.Html()
 				re := regexp.MustCompile(`href=['"](/uc\?export=download[^'"]+confirm=[^'"]+)['"]`)
 				if match := re.FindStringSubmatch(htmlStr); len(match) > 1 {
@@ -981,26 +982,27 @@ func downloadFiles(ctx context.Context, bot *tgbotapi.BotAPI, chatID int64, msgI
 			}
 
 			if confirmURL != "" {
+				// FIX 400 ERROR: Universally unescape HTML entities in the URL!
+				confirmURL = strings.ReplaceAll(confirmURL, "&amp;", "&")
+
 				if strings.HasPrefix(confirmURL, "/") {
-					confirmURL = "https://docs.google.com" + strings.ReplaceAll(confirmURL, "&amp;", "&")
+					confirmURL = "https://drive.google.com" + confirmURL
 				}
 
-				// Fire a SECOND request to the actual confirmation link to rip the file
 				fileReq2, _ := http.NewRequestWithContext(ctx, "GET", confirmURL, nil)
 				fileReq2.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
-				fileResp, err = client.Do(fileReq2) // Overwrite fileResp with the real file stream
+				fileResp, err = client.Do(fileReq2)
 				if err != nil {
 					return tmpDir, "", "", err
 				}
-				finalDownloadURL = confirmURL // Update URL so the extension extractor below works properly
+				finalDownloadURL = confirmURL
 			} else {
 				return tmpDir, "", "", fmt.Errorf("could not bypass Google Drive warning page")
 			}
 		}
 	}
-	defer fileResp.Body.Close() // Ensure whatever stream is currently open gets safely closed
-	// -------------------------------------------
+	defer fileResp.Body.Close()
 
 	if fileResp.StatusCode != 200 {
 		return tmpDir, "", "", fmt.Errorf("server rejected request: Status %d", fileResp.StatusCode)
