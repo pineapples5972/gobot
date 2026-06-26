@@ -157,6 +157,22 @@ func sanitizeFilename(name string) string {
 	return strings.TrimSpace(clean)
 }
 
+// Extracts the File ID from a Google Drive link and returns a direct download URL
+func parseGoogleDriveLink(linkURL string) (string, bool) {
+	// Regex to match typical GDrive file sharing URL patterns
+	re := regexp.MustCompile(`drive\.google\.com/file/d/([a-zA-Z0-9_-]+)`)
+	match := re.FindStringSubmatch(linkURL)
+
+	if len(match) > 1 {
+		fileID := match[1]
+		// Construct the direct download link format that bypasses the web UI viewer
+		directDownloadURL := fmt.Sprintf("https://docs.google.com/uc?export=download&id=%s", fileID)
+		return directDownloadURL, true
+	}
+
+	return "", false
+}
+
 func formatArchiveSize(sizeStr string) float64 {
 	bytes, _ := strconv.ParseFloat(sizeStr, 64)
 	return bytes / (1024 * 1024)
@@ -557,8 +573,10 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	// --- NEW: EXPAND SHORTENED LINKS ---
 	for i, u := range urls {
-		// Bypass the un-shortener if it is already a standard direct link!
-		if strings.Contains(u, "archive.org/details/") || strings.Contains(u, "libgen.") {
+		// Bypass the un-shortener if it is already a direct/supported link!
+		if strings.Contains(u, "archive.org/details/") ||
+			strings.Contains(u, "libgen.") ||
+			strings.Contains(u, "drive.google.com") {
 			continue
 		}
 		urls[i] = resolveShortLink(u)
@@ -566,7 +584,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	// --- SCAN LINKS FOR REACTIONS ---
 	var linkReactions []string
-	hasArchive, hasLibgen := false, false
+	hasArchive, hasLibgen, hasDrive := false, false, false
 
 	for _, u := range urls {
 		if strings.Contains(u, "archive.org") && !hasArchive {
@@ -576,6 +594,10 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		if strings.Contains(u, "libgen") && !hasLibgen {
 			linkReactions = append(linkReactions, "⚡")
 			hasLibgen = true
+		}
+		if strings.Contains(u, "drive.google.com") && !hasDrive {
+			linkReactions = append(linkReactions, "📁")
+			hasDrive = true
 		}
 	}
 	addReactions(bot, chatID, msg.MessageID, linkReactions...)
@@ -590,6 +612,27 @@ func processSingleLink(bot *tgbotapi.BotAPI, chatID int64, linkURL string, itemN
 		handleArchiveMenu(bot, chatID, linkURL)
 		return
 	}
+
+	// --- NEW: Intercept Google Drive links before the normal pipeline ---
+	if strings.Contains(linkURL, "drive.google.com") {
+		directLink, success := parseGoogleDriveLink(linkURL)
+		if success {
+			var keyboard = tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonURL("🚀 Direct Download", directLink),
+				),
+			)
+
+			msg := tgbotapi.NewMessage(chatID, "📁 *Google Drive File Detected*\n\nYou can download the file directly using the button below:")
+			msg.ParseMode = "Markdown"
+			msg.ReplyMarkup = keyboard
+			bot.Send(msg)
+		} else {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ Could not extract Google Drive File ID."))
+		}
+		return // Stop processing so it doesn't trigger a rename prompt!
+	}
+	// -------------------------------------------------------------------
 
 	statusMsg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔍 Analyzing Link #%d...", itemNum))
 	sentStatus, err := bot.Send(statusMsg)
