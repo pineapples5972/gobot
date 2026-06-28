@@ -532,7 +532,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		delete(userStates, activeMsgID)
 		userStateMutex.Unlock()
 
-		addReactions(bot, chatID, msg.MessageID, "🕊")
+		// addReactions(bot, chatID, msg.MessageID, "🕊")
 
 		// If renaming an Archive menu item:
 		if activeState.State == "AWAITING_ARCHIVE_RENAME" {
@@ -584,7 +584,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	}
 
 	// --- SCAN LINKS FOR REACTIONS ---
-	var linkReactions []string
+	/* var linkReactions []string
 	hasArchive, hasLibgen, hasDrive := false, false, false
 
 	for _, u := range urls {
@@ -601,7 +601,7 @@ func handleUserMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			hasDrive = true
 		}
 	}
-	addReactions(bot, chatID, msg.MessageID, linkReactions...)
+	addReactions(bot, chatID, msg.MessageID, linkReactions...)*/
 
 	for i, u := range urls {
 		go processSingleLink(bot, chatID, u, i+1)
@@ -1113,6 +1113,7 @@ func removeClickedButton(bot *tgbotapi.BotAPI, query *tgbotapi.CallbackQuery) {
 	bot.Send(edit)
 }
 
+/*
 func addReactions(bot *tgbotapi.BotAPI, chatID int64, msgID int, emojis ...string) {
 	if len(emojis) == 0 {
 		return
@@ -1129,7 +1130,7 @@ func addReactions(bot *tgbotapi.BotAPI, chatID int64, msgID int, emojis ...strin
 	reactionJSON, _ := json.Marshal(reactions)
 	params["reaction"] = string(reactionJSON)
 	bot.MakeRequest("setMessageReaction", params)
-}
+}*/
 
 func startSessionCleaner() {
 	ticker := time.NewTicker(1 * time.Hour)
